@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""agssh - run commands on registered persist-ssh hosts over one shared
+ControlMaster connection per alias.
+
+    agssh <alias> [--workdir DIR] [--timeout N] [--json] -- <command...>
+    agssh ls
+    agssh read <alias> <path> [--offset N] [--limit N] [--json]
+    agssh find <alias> <pattern> [--path DIR] [--glob G] [--context N]
+                                 [--limit N] [--json]
+    agssh uninstall
+
+Thin CLI over the persist-ssh executor - the same module the agssh plugin
+loads. execute() returns the envelope dict and never prints or exits; this
+CLI prints envelope["output"] on stdout, envelope["error"] on stderr, and
+exits with the remote exit_code when >= 0, else 255.
+
+Stdlib only.
+"""
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+
+ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
+
+# Registry keys agssh adds on top of persist-ssh's own host fields; stripped
+# by `agssh uninstall`.
+STRIP_KEYS = ("as_tool", "default_workdir", "login_shell", "connect_timeout",
+              "notes")
+
+USAGE = """\
+usage:
+  agssh <alias> [--workdir DIR] [--timeout N] [--json] -- <command...>
+  agssh ls
+  agssh read <alias> <path> [--offset N] [--limit N] [--json]
+  agssh find <alias> <pattern> [--path DIR] [--glob G] [--context N] [--limit N] [--json]
+  agssh uninstall
+"""
+
+
+def _executor_path():
+    return os.environ.get("AGSSH_EXECUTOR") or os.path.expanduser(
+        "~/.hermes/skills/devops/persistent-ssh/scripts/persist-ssh.py")
+
+
+def load_executor():
+    path = _executor_path()
+    spec = importlib.util.spec_from_file_location("persist_ssh", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def die(msg, code=255):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def get_executor():
+    """Lazy-load persist-ssh.py; a missing/broken file is a clean exit 255."""
+    path = _executor_path()
+    if not os.path.isfile(path):
+        die(f"agssh: persist-ssh executor not found at {path}"
+            " (set AGSSH_EXECUTOR to its location)")
+    try:
+        return load_executor()
+    except Exception as exc:
+        die(f"agssh: failed to load executor at {path}: {exc}")
+
+
+def _argv_command(argv):
+    """Compose an argv sequence into the shell string execute() runs remotely.
+
+    Equivalent to the executor's intended argv handling (quote each element,
+    join with one space); passing it as a string keeps the script one shell
+    word inside `bash -c ...` on every executor version.
+    """
+    return " ".join(shlex.quote(str(part)) for part in argv)
+
+
+def emit(env, as_json):
+    """Write the envelope per the CLI rule; return the process exit code."""
+    if as_json:
+        print(json.dumps(env, ensure_ascii=False))
+    else:
+        sys.stdout.write(env.get("output") or "")
+        if env.get("error"):
+            print(env["error"], file=sys.stderr)
+    code = env.get("exit_code", -1)
+    return code if isinstance(code, int) and code >= 0 else 255
+
+
+def cmd_exec(argv):
+    p = argparse.ArgumentParser(
+        prog="agssh",
+        usage="agssh <alias> [--workdir DIR] [--timeout N] [--json] -- <command...>",
+        description="Run a command on a registered host over its shared"
+                    " ControlMaster connection.",
+    )
+    p.add_argument("alias", help="registry host alias")
+    p.add_argument("--workdir", metavar="DIR",
+                   help="remote working directory (overrides default_workdir)")
+    p.add_argument("--timeout", type=int, metavar="N",
+                   help="remote timeout in seconds, 1-600 (default 180)")
+    p.add_argument("--json", action="store_true",
+                   help="print the raw envelope as JSON")
+    if "--" not in argv:
+        p.error("expected '-- <command...>'")
+    head, command = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    args = p.parse_args(head)
+    if not command:
+        p.error("missing command after '--'")
+    if not ALIAS_RE.fullmatch(args.alias):
+        p.error(f"invalid alias '{args.alias}'"
+                " (want [a-z0-9][a-z0-9-]{0,30})")
+    ex = get_executor()
+    timeout_s = (args.timeout if args.timeout is not None
+                 else getattr(ex, "DEFAULT_TIMEOUT_S", 180))
+    env = ex.execute(args.alias, " ".join(command),
+                     workdir=args.workdir, timeout_s=timeout_s)
+    return emit(env, args.json)
+
+
+def cmd_ls(argv):
+    p = argparse.ArgumentParser(prog="agssh ls",
+                              description="List registry hosts.")
+    p.parse_args(argv)
+    ex = get_executor()
+    hosts = ex.load_config().get("hosts", {})
+    rows = []
+    for name in sorted(hosts):
+        info = hosts[name]
+        if not isinstance(info, dict):
+            info = {}
+        try:
+            state = ex.socket_state(name, info)
+        except Exception:
+            state = "?"
+        rows.append((name,
+                     "true" if info.get("as_tool", True) else "false",
+                     state,
+                     str(info.get("notes") or "")))
+    if not rows:
+        print("no hosts registered")
+        return 0
+    width = max(len("alias"), max(len(r[0]) for r in rows))
+    print(f"{'alias':<{width}}  as_tool  socket  notes")
+    for name, as_tool, state, notes in rows:
+        print(f"{name:<{width}}  {as_tool:<7}  {state:<6}  {notes}")
+    return 0
+
+
+def cmd_read(argv):
+    p = argparse.ArgumentParser(
+        prog="agssh read",
+        usage="agssh read <alias> <path> [--offset N] [--limit N] [--json]",
+        description="Read a slice of a remote file (sed line range).")
+    p.add_argument("alias", help="registry host alias")
+    p.add_argument("path", help="absolute remote path")
+    p.add_argument("--offset", type=int, default=1,
+                   help="first line to read (default 1)")
+    p.add_argument("--limit", type=int, default=2000,
+                   help="max lines to read (default 2000, max 2000)")
+    p.add_argument("--json", action="store_true",
+                   help="print the raw envelope as JSON")
+    args = p.parse_args(argv)
+    ex = get_executor()
+    env = ex.execute(
+        args.alias,
+        _argv_command(ex.read_argv(args.path, args.offset, args.limit)))
+    return emit(env, args.json)
+
+
+def cmd_find(argv):
+    p = argparse.ArgumentParser(
+        prog="agssh find",
+        usage="agssh find <alias> <pattern> [--path DIR] [--glob G]"
+              " [--context N] [--limit N] [--json]",
+        description="Recursive grep -nE on a remote host.")
+    p.add_argument("alias", help="registry host alias")
+    p.add_argument("pattern", help="extended regex")
+    p.add_argument("--path", metavar="DIR",
+                   help="remote directory (default: the host's"
+                        " default_workdir)")
+    p.add_argument("--glob", dest="file_glob", metavar="G",
+                   help="grep --include file glob")
+    p.add_argument("--context", type=int, default=0, metavar="N",
+                   help="context lines, max 20 (default 0)")
+    p.add_argument("--limit", type=int, default=50, metavar="N",
+                   help="max matching lines (default 50, max 200)")
+    p.add_argument("--json", action="store_true",
+                   help="print the raw envelope as JSON")
+    args = p.parse_args(argv)
+    ex = get_executor()
+    path = args.path
+    if not path:
+        info = ex.load_config().get("hosts", {}).get(args.alias) or {}
+        if isinstance(info, dict):
+            path = info.get("default_workdir")
+    if not path:
+        die(f"path required for 'find' on '{args.alias}' (no default_workdir)")
+    env = ex.execute(
+        args.alias,
+        _argv_command(
+            ex.find_argv(args.pattern, path, args.file_glob, args.context)))
+    env = ex.find_result(env, args.limit)
+    return emit(env, args.json)
+
+
+def _remove(path, rmtree_ok=True):
+    """Remove one path (symlink, file, or dir) and print the action."""
+    if os.path.islink(path):
+        os.remove(path)
+        print(f"removed symlink {path}")
+    elif os.path.isdir(path):
+        if not rmtree_ok:
+            print(f"left {path} (a directory, expected a file or symlink)")
+            return
+        shutil.rmtree(path)
+        print(f"removed directory {path}")
+    elif os.path.exists(path):
+        os.remove(path)
+        print(f"removed {path}")
+    else:
+        print(f"not present: {path}")
+
+
+def cmd_uninstall(argv):
+    p = argparse.ArgumentParser(
+        prog="agssh uninstall",
+        description="Remove the agssh plugin, CLI, logs and cache; strip"
+                    " agssh keys from the host registry. Hosts, control"
+                    " sockets and ~/.ssh/config are left alone.")
+    p.parse_args(argv)
+    ex = get_executor()
+    home = os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
+
+    _remove(os.path.join(home, "plugins", "agssh"))
+    _remove(os.path.join(os.path.expanduser("~"), "bin", "agssh"),
+            rmtree_ok=False)
+    for name in ("agssh.log", "agssh.log.1", "agssh.log.lock"):
+        _remove(os.path.join(home, "logs", name))
+    _remove(os.path.join(home, "cache", "agssh"))
+
+    cfg = ex.load_config()
+    hosts = cfg.get("hosts", {})
+    stripped = 0
+    for info in hosts.values():
+        if not isinstance(info, dict):
+            continue
+        for key in STRIP_KEYS:
+            if key in info:
+                del info[key]
+                stripped += 1
+    ex.save_config(cfg)
+    print(f"stripped {stripped} agssh key(s) from the registry"
+          f" ({len(hosts)} host(s) kept, other keys untouched)")
+
+    for name, info in hosts.items():
+        if not isinstance(info, dict):
+            continue
+        try:
+            cp = ex.control_path(name, info)
+        except (KeyError, TypeError):
+            print(f"'{name}': control path unknown (incomplete host entry)")
+            continue
+        print(f"'{name}': control socket {cp} left in place;"
+              f" 'persist-ssh close {name}' removes the master")
+    print("left ~/.ssh/cm-* sockets, ~/.ssh/cm-*.lock and ~/.ssh/config"
+          " untouched")
+    print("note: tools already loaded remain until the next session")
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        sys.stderr.write(USAGE)
+        return 2
+    if argv[0] in ("-h", "--help"):
+        sys.stdout.write(USAGE)
+        return 0
+    verb, rest = argv[0], argv[1:]
+    if verb == "ls":
+        return cmd_ls(rest)
+    if verb == "read":
+        return cmd_read(rest)
+    if verb == "find":
+        return cmd_find(rest)
+    if verb == "uninstall":
+        return cmd_uninstall(rest)
+    return cmd_exec(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
