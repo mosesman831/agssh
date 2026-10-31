@@ -1,0 +1,25 @@
+# Ignore spec/plan docs — never commit these (IP rule)
+SPEC*
+spec*
+PLAN*
+ARCHITECTURE*
+DESIGN*
+*SPEC*.md
+*PLAN*.md
+*DRAFT*.md
+*-prompt.md
+docs/specs/
+
+# Local/scratch
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+.cache/
+tmp/
+.env
+.env.*
+!.env.example
