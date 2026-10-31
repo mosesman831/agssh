@@ -1,0 +1,5 @@
+name: agssh
+version: 1.0.0
+description: "SSH hosts as native tools: per-host command tools plus read/find/hosts, one registry shared with the persist-ssh CLI, real remote exit codes."
+provides_hooks: [pre_tool_call]
+provides_tools: [agssh-read, agssh-find, agssh-hosts]
