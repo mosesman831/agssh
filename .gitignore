@@ -8,6 +8,9 @@ DESIGN*
 *PLAN*.md
 *DRAFT*.md
 *-prompt.md
+*PROMPT*
+.devin-prompt*
+.devin-ref/
 docs/specs/
 
 # Local/scratch
