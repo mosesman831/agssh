@@ -69,7 +69,8 @@ def _install_stub(module_name, attrs):
 
 
 def _stub_request_tool_approval(tool_name, description, rule_key=None, **kwargs):
-    return {"action": "approve", "message": "approved (tools.approval stub)"}
+    # Real _run_approval_gate shape: {"approved": bool, "message": ...}
+    return {"approved": True, "message": "approved (tools.approval stub)"}
 
 
 def _stub_detect_hardline_command(command):

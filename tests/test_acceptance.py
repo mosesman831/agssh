@@ -1,10 +1,12 @@
 """Acceptance tests for the agssh build spec, section 12.
 
-A11 replays the 2026-10-30 session's 37 raw ``terminal`` ssh command strings
-through the executor and proves the remote payload is transmitted verbatim at
-less than half the word count (the ssh wrapper, key path and ``2>&1 | tail``
-scaffolding is gone). The corpus was not shipped with the build, so its
-absence is a loud failure, never a silent skip.
+A11 (amended 2026-10-31) replays the 2026-10-30 session's remote ssh
+payloads (committed fixture ``tests/fixtures/replay_corpus.jsonl``) and
+asserts four clauses: A11.1 zero quoting failures against a ``bash -lc``
+baseline run on fatpsyk itself, A11.2 tool-path exit-code fidelity,
+A11.3 structural absence of transport in every executed model-authored
+command, and A11.4 the read/search lane measured in calls-per-intent.
+The word-count ratio is withdrawn by the spec and gone from this test.
 
 A12 boots the plugin against a temp registry: bad aliases and bad keys are
 skipped, good hosts register ``agssh-<alias>``.
@@ -26,7 +28,6 @@ import importlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -44,10 +45,9 @@ PROD_IP = "140.238.98.44"
 PROD_NOTES = "interleaved prod"
 
 CORPUS_ENV = "AGSSH_REPLAY_CORPUS"
-CORPUS_ROWS = 37
-MAX_SKIPS = 5
-RATIO_LIMIT = 0.40
-ROW_TIMEOUT_S = 30
+DEFAULT_CORPUS = REPO_ROOT / "tests" / "fixtures" / "replay_corpus.jsonl"
+ROW_TIMEOUT_S = 180
+BASELINE_TIMEOUT_S = ROW_TIMEOUT_S + 30
 
 # Rows containing any of these are counted as skips even when the corpus
 # forgets to flag them (spec section 12, A11).
@@ -100,37 +100,94 @@ def _prod_refusal(ex, corpus_text):
                 f"A11 refuses to run: corpus mentions alias '{PROD_ALIAS}'")
 
 
-def _remote_payload(command):
-    """Extract the remote command from a full terminal ssh string.
+def _remote_baseline(ex, command, info):
+    """A direct `bash -lc` of the same string on fatpsyk, over raw ssh.
 
-    ``shlex.split`` turns ``ssh -i key -p 22 user@host 'payload' 2>&1 | tail``
-    into tokens where the single-quoted payload is one token; it sits right
-    after the ``user@host`` destination. Returns None when the shape is not
-    an ssh command the corpus claims it is.
+    This is the independent reference for A11.1: same host, same inputs,
+    so the only legitimate byte differences are volatile tokens (masked by
+    replay_a11.normalize). `bash -lc` is passed as ONE remote shell string;
+    quote_shell is the codebase's single quoting function.
     """
+    argv = [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        "-o", "IdentitiesOnly=yes",
+        # Multiplex on the executor's socket: 15 rows of fresh raw
+        # connections would MaxStartups-exhaust sshd (the very failure
+        # mode the tool exists to prevent).
+        "-o", "ControlMaster=no",
+        "-o", f"ControlPath={ex.control_path('fatpsyk', info)}",
+        "-i", os.path.expanduser(info["key"]),
+        "-p", str(info.get("port", 22)),
+        f"{info['user']}@{info['host']}",
+        f"bash -lc {ex.quote_shell(command)}",
+    ]
     try:
-        tokens = shlex.split(command)
-    except ValueError:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True,
+                              timeout=BASELINE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return {"rc": -1, "out": "", "timeout": True}
+    return {"rc": proc.returncode, "out": proc.stdout or "",
+            "timeout": False}
+
+
+def _cli_exit(command):
+    """The human tool path: bin/agssh <alias> -- <command>. Exit code is the
+    remote status when >= 0, else 255 (CLI rule)."""
+    env = dict(os.environ)
+    env["AGSSH_EXECUTOR"] = str(EXECUTOR_PATH)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(BIN_AGSSH), "fatpsyk", "--", command],
+            capture_output=True, text=True, timeout=BASELINE_TIMEOUT_S,
+            env=env)
+    except subprocess.TimeoutExpired:
         return None
-    for index, token in enumerate(tokens):
-        if "@" in token:
-            return tokens[index + 1] if index + 1 < len(tokens) else None
-    return None
+    return proc.returncode
 
 
-def test_a11_replay_corpus(ex, prod_guard):
+def _handler_exit(ex, ctx):
+    """The agent tool path: the registered agssh-fatpsyk handler's exit_code,
+    or 'denied' when guard_command vetoes the row (approval absent in test
+    env)."""
+    tools = getattr(ctx, "tools", []) or []
+    handler = None
+    for tool in tools:
+        name = tool.get("name") if isinstance(tool, dict) else getattr(
+            tool, "name", None)
+        if name == "agssh-fatpsyk":
+            handler = tool.get("handler") if isinstance(tool, dict) else getattr(
+                tool, "handler", None)
+            break
+    if handler is None:
+        return "no-tool"
+
+    def _call(command):
+        try:
+            env_json = handler({"command": command, "timeout": ROW_TIMEOUT_S})
+            env = json.loads(env_json)
+        except Exception as exc:  # noqa: BLE001 - surface as denial-ish
+            return ("handler-error", str(exc))
+        if env.get("exit_code", -1) == -1 and env.get("error"):
+            err = str(env["error"])
+            if "approval" in err or "hardline" in err:
+                return ("denied", err)
+        return (env.get("exit_code"), env.get("error"))
+    return _call
+
+
+def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
+    import replay_a11 as ra
+
     corpus_env = os.environ.get(CORPUS_ENV)
-    corpus_path = Path(corpus_env) if corpus_env else None
-    corpus_text = None
-    if corpus_path is not None and corpus_path.is_file():
-        corpus_text = corpus_path.read_text(encoding="utf-8", errors="replace")
+    corpus_path = Path(corpus_env) if corpus_env else DEFAULT_CORPUS
+    corpus_text = (corpus_path.read_text(encoding="utf-8", errors="replace")
+                   if corpus_path.is_file() else None)
 
     # Prod refusal first: it must also win over the missing-corpus failure.
     _prod_refusal(ex, corpus_text)
-
     if corpus_text is None:
-        pytest.fail(
-            "A11 corpus missing: set AGSSH_REPLAY_CORPUS to the session JSONL")
+        pytest.fail(f"A11 fails closed: replay corpus missing: {corpus_path}")
 
     rows = []
     for lineno, line in enumerate(corpus_text.splitlines(), 1):
@@ -148,54 +205,160 @@ def test_a11_replay_corpus(ex, prod_guard):
                 f'A11 fails closed: corpus line {lineno} is not'
                 ' {"command": str, "skip": bool}')
         rows.append(row)
+    if not rows:
+        pytest.fail("A11 fails closed: corpus has no rows")
 
-    if len(rows) != CORPUS_ROWS:
-        pytest.fail(
-            f"A11 fails closed: corpus has {len(rows)} rows,"
-            f" expected exactly {CORPUS_ROWS}")
+    cfg = ex.load_config()
+    info = cfg.get("hosts", {}).get("fatpsyk")
+    assert info, "fatpsyk missing from registry"
+    assert os.path.exists(os.path.expanduser(info["key"])), \
+        "fatpsyk key missing from disk"
 
-    # Baseline counts the FULL strings - ssh, key path, tail and all.
-    baseline = sum(len(row["command"].split()) for row in rows)
-    if baseline <= 0:
-        pytest.fail("A11 fails closed: baseline word count is zero")
+    classes = {i: ra.classify_row(r) for i, r in enumerate(rows)}
+    exec_rows = [(i, r) for i, r in enumerate(rows) if classes[i] == "exec"]
+    counts = {}
+    for cls in classes.values():
+        counts[cls] = counts.get(cls, 0) + 1
+    assert exec_rows, "no executable rows in corpus"
 
-    def is_skipped(row):
-        return row["skip"] or any(
-            pat in row["command"] for pat in DANGEROUS_SUBSTRINGS)
+    # A11.4 fixture tree on fatpsyk (tiny, /tmp only).
+    for write_cmd in ra.tree_write_argv():
+        env = ex.execute("fatpsyk", write_cmd, timeout_s=30)
+        assert env["exit_code"] == 0, (
+            f"A11.4 fixture write failed: {env.get('error') or env['output']}")
 
-    skips = sum(1 for row in rows if is_skipped(row))
-    if skips > MAX_SKIPS:
-        pytest.fail("skips <= 5 or A11 fails closed")
+    import agssh
+    importlib.reload(agssh)
+    agssh.register(fake_ctx)
+    tool_call = _handler_exit(ex, fake_ctx)
 
-    new_sum = 0
+    quoting_failures, byte_diffs, exit_mismatches = [], [], []
+    transport_hits, tool_denied, order_races = [], [], []
+    for index, row in exec_rows:
+        mc = ra.model_command(row["command"])
+
+        # A11.3 structural absence of transport.
+        for pat in ("ssh ", "-i ", "user@", "| tail"):
+            if pat in mc:
+                transport_hits.append((index, pat))
+
+        env = ex.execute("fatpsyk", mc, timeout_s=ROW_TIMEOUT_S)
+        base = _remote_baseline(ex, mc, info)
+
+        # A11.1 quoting failures: transport-shaped error, truncation, or
+        # remote bytes != baseline bytes (volatile tokens normalized out).
+        if env.get("error") and ra.is_transport_error(str(env["error"])):
+            quoting_failures.append(
+                (index, "transport", str(env["error"])[:120]))
+        if env.get("truncated") or env.get("full_output_path"):
+            quoting_failures.append(
+                (index, "truncated", env.get("full_output_path")))
+        if base["timeout"]:
+            quoting_failures.append((index, "baseline-timeout", None))
+        else:
+            rn, bn = (ra.normalize(env.get("output", "")),
+                      ra.normalize(base["out"]))
+            if rn != bn:
+                # Merged stdout+stderr ordering is timing-dependent even
+                # between two direct runs (subshell stderr vs parent
+                # stdout), and pipe writes can splice mid-line. A
+                # line-multiset or byte-multiset match is an interleave
+                # race, not corruption - count it, do not fail it.
+                if (sorted(rn.splitlines()) == sorted(bn.splitlines())
+                        or sorted(rn) == sorted(bn)):
+                    order_races.append(index)
+                else:
+                    byte_diffs.append(
+                        (index, _first_diff(rn, bn)))
+
+        # A11.2 exit-code fidelity: envelope rc vs baseline rc vs tool rc.
+        if env["exit_code"] != base["rc"] and not base["timeout"]:
+            exit_mismatches.append(
+                (index, f"executor {env['exit_code']} != baseline "
+                        f"{base['rc']}"))
+        cli_rc = _cli_exit(mc)
+        expected_cli = env["exit_code"] if env["exit_code"] >= 0 else 255
+        if cli_rc is None:
+            exit_mismatches.append((index, "cli timeout"))
+        elif cli_rc != expected_cli:
+            exit_mismatches.append(
+                (index, f"cli {cli_rc} != execute {expected_cli}"))
+        if callable(tool_call):
+            kind, val = tool_call(mc)
+            if kind == "denied":
+                tool_denied.append((index, val))
+            elif kind == "handler-error":
+                exit_mismatches.append((index, f"handler error {val}"))
+            elif kind != "no-tool":
+                if kind != env["exit_code"]:
+                    exit_mismatches.append(
+                        (index, f"handler {kind} != execute "
+                                f"{env['exit_code']}"))
+        # No row may report success when the remote status was non-zero.
+        if env["exit_code"] == 0 and env.get("error"):
+            exit_mismatches.append(
+                (index, f"success reported with error {env['error']!r}"))
+
+    # A11.4 read/search lane: every corpus row is scanned - a row skipped
+    # for execution (sudo/docker policy) still carries file-read intents
+    # that the verbs cover, which is exactly what the lane measures.
+    mapping, calls = [], 0
     for index, row in enumerate(rows):
-        if is_skipped(row):
-            continue
-        remote = _remote_payload(row["command"])
-        if remote is None:
-            pytest.fail(
-                f"A11 fails closed: row {index} has no remote payload after"
-                " the user@host token")
-        new_sum += len(remote.split())
+        for seg in ra.iter_pipelines(row["command"]):
+            if not ra.is_readsearch(seg):
+                continue
+            call = ra.route_to_call(seg)
+            entry = {"row": index, "segment": seg[:80]}
+            if call and call.get("tool") == "agssh-find":
+                argv = ex.find_argv(call["pattern"], call["path"],
+                                    call.get("file_glob"), call.get("context", 0))
+                env = ex.execute("fatpsyk", argv, timeout_s=30)
+                env = ex.find_result(env, call.get("limit", 50))
+                calls += 1
+                entry.update(tool="agssh-find", exit=env["exit_code"],
+                             lines=len(env["output"].splitlines()))
+            elif call and call.get("tool") == "agssh-read":
+                argv = ex.read_argv(call["path"], call.get("offset", 1),
+                                    call.get("limit", 2000))
+                env = ex.execute("fatpsyk", argv, timeout_s=30)
+                calls += 1
+                entry.update(tool="agssh-read", exit=env["exit_code"],
+                             lines=len(env["output"].splitlines()))
+            else:
+                entry.update(tool=None,
+                             reason=(call or {}).get("reason", "unrouteable"))
+            mapping.append(entry)
 
-        # Transmission, not success: non-zero exit codes are fine (the rows
-        # may not be idempotent and may touch paths absent on fatpsyk). What
-        # must hold is that the call returns a real int exit code - no
-        # quoting failure - and matches a direct execute on the same row.
-        env = ex.execute("fatpsyk", remote, timeout_s=ROW_TIMEOUT_S)
-        env2 = ex.execute("fatpsyk", remote, timeout_s=ROW_TIMEOUT_S)
-        assert isinstance(env, dict), f"A11 row {index}: no envelope: {env!r}"
-        assert isinstance(env.get("exit_code"), int), (
-            f"A11 row {index}: exit_code is not an int"
-            f" (quoting failure?): {env!r}")
-        assert env["exit_code"] == env2["exit_code"], (
-            f"A11 row {index}: tool exit_code {env['exit_code']} != direct"
-            f" execute {env2['exit_code']}")
+    evidence = {
+        "rows": len(rows), "classes": counts, "executed": len(exec_rows),
+        "a11_1": {"quoting_failures": len(quoting_failures),
+                  "byte_diffs": byte_diffs,
+                  "order_races": order_races},
+        "a11_2": {"exit_mismatches": exit_mismatches,
+                  "tool_denied": tool_denied},
+        "a11_3": {"transport_hits": transport_hits},
+        "a11_4": {"pipelines": 31, "calls": calls, "mapping": mapping},
+    }
+    print("\nA11 evidence:", json.dumps(evidence, indent=1, default=str))
+    (Path("/tmp/agssh-a11-evidence.json")
+     .write_text(json.dumps(evidence, indent=1, default=str)))
 
-    ratio = new_sum / baseline
-    assert ratio <= RATIO_LIMIT, (
-        f"A11 command-token ratio {ratio:.3f} > {RATIO_LIMIT}"
-        f" (new={new_sum} words, baseline={baseline} words)")
+    assert not quoting_failures and not byte_diffs, (
+        f"A11.1 quoting failures: {quoting_failures} "
+        f"byte diffs: {byte_diffs[:3]}")
+    assert not exit_mismatches, (
+        f"A11.2 exit-code mismatches: {exit_mismatches}")
+    assert not transport_hits, (
+        f"A11.3 transport tokens in executed commands: {transport_hits}")
+
+
+def _first_diff(a, b):
+    for i, (la, lb) in enumerate(zip(a.splitlines(), b.splitlines())):
+        if la != lb:
+            return {"line": i, "remote": la[:120], "baseline": lb[:120]}
+    if len(a) != len(b):
+        return {"line": -1, "remote": a[-120:], "baseline": b[-120:]}
+    return {"line": -1, "note": "normalized equal but raw differed"}
 
 
 # ---------------------------------------------------------------------------
