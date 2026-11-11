@@ -257,3 +257,77 @@ def test_a19_vendored_executor_no_skill(ex, test_host, tmp_registry,
     assert env["exit_code"] == 0
     assert env["error"] is None
     assert env["output"].strip()
+
+
+# --------------------------------------------------------------------------
+# A20: argv-form `agssh <alias> -- <command...>` regression for cmd_exec.
+#
+# After `--`, len(command)>1 composes the remote string as
+# " ".join(shlex.quote(e) for e in command); len(command)==1 passes the
+# element through byte-exact. A bare join would splice `sh -c 'exit 7'`
+# into `sh -c exit 7`, running `sh -c exit` and losing the remote exit
+# code. These tests run bin/agssh as a real subprocess so the remote exit
+# code becomes the process returncode and remote stdout lands byte-exact
+# on proc.stdout. `ex` is taken for its env side effects: the exported
+# AGSSH_EXECUTOR (and isolated HERMES_HOME) ride into the child via
+# env=os.environ.copy(); `test_host` skips early if the alias is unknown.
+# --------------------------------------------------------------------------
+
+AGSSH_CLI = os.path.join(REPO_ROOT, "bin", "agssh")
+
+
+def _run_cli(command):
+    """Run `agssh <TEST_ALIAS> -- <command...>` in a fresh process.
+
+    ``command`` is the argv list after ``--`` (one element per remote
+    word). Returns the CompletedProcess with byte stdout/stderr.
+    """
+    return subprocess.run(
+        [sys.executable, AGSSH_CLI, TEST_ALIAS, "--", *command],
+        capture_output=True,
+        env=os.environ.copy(),
+        timeout=120,
+    )
+
+
+@requires_host
+def test_a20a_argv_exit_code_7(ex, test_host):
+    """["sh", "-c", "exit 7"] must yield remote exit 7 — a bare join would
+    splice to `sh -c exit 7`, which runs `sh -c exit` and returns 0."""
+    proc = _run_cli(["sh", "-c", "exit 7"])
+    assert proc.returncode == 7, f"rc={proc.returncode} stderr={proc.stderr!r}"
+
+
+@requires_host
+def test_a20b_argv_exit_code_3(ex, test_host):
+    """Same shape, different code: remote `exit 3` survives as rc 3."""
+    proc = _run_cli(["sh", "-c", "exit 3"])
+    assert proc.returncode == 3, f"rc={proc.returncode} stderr={proc.stderr!r}"
+
+
+@requires_host
+def test_a20c_argv_byte_exact_nasty(ex, test_host):
+    """printf %s emits the argv element verbatim — every shell metachar
+    (squote, dquote, $, backtick, backslash, newline, tab) survives the
+    quote-each-element-and-join path byte-exact, with no trailing newline
+    added by any layer."""
+    nasty = "a'b\"c$HOME`x`\\d\n\tend"
+    proc = _run_cli(["printf", "%s", nasty])
+    assert proc.returncode == 0, f"rc={proc.returncode} stderr={proc.stderr!r}"
+    assert proc.stdout == nasty.encode("utf-8")
+
+
+@requires_host
+def test_a20d_argv_echo_words(ex, test_host):
+    """Plain words join with single spaces: `echo a b c` -> "a b c\\n"."""
+    proc = _run_cli(["echo", "a", "b", "c"])
+    assert proc.returncode == 0, f"rc={proc.returncode} stderr={proc.stderr!r}"
+    assert proc.stdout == b"a b c\n"
+
+
+@requires_host
+def test_a20e_single_element_passthrough(ex, test_host):
+    """One element after `--` is passed through byte-exact, so the caller's
+    own quoting is honoured: ["sh -c 'exit 7'"] still exits 7."""
+    proc = _run_cli(["sh -c 'exit 7'"])
+    assert proc.returncode == 7, f"rc={proc.returncode} stderr={proc.stderr!r}"

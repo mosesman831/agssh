@@ -132,7 +132,12 @@ def cmd_exec(argv):
     ex = get_executor()
     timeout_s = (args.timeout if args.timeout is not None
                  else getattr(ex, "DEFAULT_TIMEOUT_S", 180))
-    env = ex.execute(args.alias, " ".join(command),
+    # Multi-element argv: each element is one remote word, so quote each
+    # and join — a bare join splices `sh -c 'exit 7'` into `sh -c exit 7`,
+    # which runs `sh -c exit` and loses the remote exit code. One element
+    # passes through byte-exact.
+    remote = command[0] if len(command) == 1 else _argv_command(command)
+    env = ex.execute(args.alias, remote,
                      workdir=args.workdir, timeout_s=timeout_s)
     return emit(env, args.json)
 
