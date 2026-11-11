@@ -1,66 +1,173 @@
 # agssh
 
-Per-host remote execution tools for AI agents. A machine in your registry becomes a tool with the
-same call shape, result shape and exit semantics as the agent's local `terminal` tool, so the model
-never builds an `ssh '...'` string again.
+SSH hosts as first-class tools for a Hermes agent. Each host in the agssh registry is reachable
+through a small, fixed tool surface — run a command, read file lines, recursive-grep, list hosts —
+over one persistent multiplexed connection per host, with real remote exit codes and the same human
+approval gate Hermes terminal commands use. The model never assembles
+`ssh -i key user@host 'quoted string'` again; it calls a tool and gets a JSON envelope back.
 
-**Status: spec stage. Nothing is built yet.** The spec is written and gated; implementation starts at
-milestone M0.
+## What it does
 
-## The problem
+Every tool call returns the same envelope:
 
-Measured over one real agent session operating a production host:
-
-- 78 terminal calls: 37 ssh, 31 file read/search through the shell, 8 run/build, 2 network
-- 32,615 characters of command text (~8.1k tokens), of which 8,986 characters were
-  `cd X && grep -n ... -A 20` pipelines
-- 2 calls failed on nested quoting; 1 used the wrong key
-- 0 of 37 exit codes survived, because every call ended `2>&1 | tail -20`
-
-The transport was being assembled by the model, per call, as a shell string. That is the bug.
-
-## The shape
-
-```
-~/.config/persist-ssh.json      one registry, shared by the human and the agent
-        │
-        ├── agssh <alias> -- <command>        CLI, remote exit code passthrough
-        ├── agssh-<alias>(command=...)        native tool, one per registered host
-        ├── agssh-read(host, path, ...)       read_file parity over the registry
-        └── agssh-find(host, pattern, ...)    search_files parity over the registry
+```json
+{"output": "...", "exit_code": 0, "host": "web1", "cwd": "/var/www",
+ "duration_ms": 42, "truncated": false, "full_output_path": null, "error": null}
 ```
 
-A call goes from this:
+Execution properties:
+
+- **One ControlMaster connection per host.** All commands multiplex over a single persistent TCP
+  connection, so rapid agent calls never consume a new sshd auth slot (`MaxStartups` is a non-issue).
+- **Byte-exact quoting.** The command travels as exactly one argv element, quoted once; no nested
+  quoting to get wrong.
+- **Real remote exit code.** `exit_code` is the remote command's status, never mapped to a transport
+  error; transport and executor failures land in `error` instead.
+- **Bounded output.** Remote output is capped at 96k chars; the full text spills to a local file
+  (`full_output_path`) and the serialized result stays under the 100k stored-result budget.
+- **No pty, no background jobs.** Interactive prompts fail fast instead of hanging; on timeout the
+  remote process is killed, not just the local `ssh`.
+- **Audit log.** Executed calls, denials and boot rejections are appended as JSONL to
+  `<HERMES_HOME>/logs/agssh.log` (`~/.hermes` unless `HERMES_HOME` is set).
+
+## Install
+
+Requirements: an OpenSSH client (`ssh` on PATH) and Hermes with plugin support.
+
+From the catalog (the plugin lives in `plugin/agssh`):
+
+```
+hermes plugins install <owner>/agssh
+```
+
+From a clone:
+
+```
+git clone <repo-url> && cd agssh
+scripts/install.sh
+```
+
+`install.sh` symlinks `plugin/agssh` into `~/.hermes/plugins/agssh` and `bin/agssh` into
+`~/bin/agssh`, and patches the `persist-ssh` skill's executor if one is installed (the plugin
+otherwise uses its own vendored copy). The CLI is optional — the agent tools do not need it — but it
+is how a human drives the same executor, and it provides `agssh add-host`. Tools appear on the next
+session.
+
+## Add a host
+
+The registry is `~/.config/agssh/hosts.json` (plugin-owned, created empty). A legacy
+`~/.config/persist-ssh.json` is merged in read-only when present — the primary wins per alias.
+`AGSSH_REGISTRY` (or `PERSIST_SSH_CONFIG`) overrides the path.
+
+```
+agssh add-host web1 --host 192.0.2.10 --user ubuntu --key ~/.ssh/id_ed25519
+```
+
+Options: `--user U` (default `root`), `--key K` (default `~/.ssh/id_rsa`), `--port P` (default `22`),
+`--workdir D` (default directory for `agssh-find` without a `path`). Without the CLI, write the same
+entry into `hosts.json` by hand — it is plain JSON. An entry may set `"as_tool": false` to stay in
+the registry without getting a command tool.
+
+Aliases must match `[a-z][a-z0-9-]{0,30}`. At session boot every entry is validated — alias shape,
+key exists, is a regular file, carries no group/other permission bits (mode 600). Bad entries are
+warned, audited and skipped, never fatal. Registry edits take effect on the next session.
+
+## The tools
+
+### `agssh` — run a command
 
 ```python
-terminal(command="ssh -i ~/.ssh/k -o BatchMode=yes ubuntu@10.0.0.1 'cd /srv/x && sudo systemctl stop app; ... 2>&1 | tail -20'")
+agssh(host="web1", command="systemctl status nginx", workdir="/var/www", timeout=60)
 ```
 
-to this:
+`host` is a JSON Schema enum of the registry's validated aliases (a plain string with an onboarding
+hint when the registry is empty). `workdir` is absolute and per-call — never sticky. `timeout` is
+1–600 s, default 180; the remote process is killed on expiry. Do not append pipes or `tail` to
+recover an exit code — `exit_code` is already the remote status.
+
+### `agssh-read` — read file lines
 
 ```python
-agssh_fat1(command="systemctl stop app")
+agssh-read(host="web1", path="/var/log/nginx/error.log", offset=200, limit=100)
 ```
 
-## Design rules
+Remote `sed -n`. `path` must be absolute, `offset` is 1-based, `limit` caps at 2000 lines.
 
-- The command is transmitted as exactly one argv element, quoted once, so it arrives byte-exact.
-- The tool's exit code is the remote command's exit code. Timeouts kill the remote process.
-- Output is capped inside the tool, which makes the `| tail` habit pointless.
-- One executor, three front doors: the CLI and the tools share one code path, so behaviour cannot
-  drift between what a human types and what the agent calls.
-- Reuses the existing `persist-ssh` control-master machinery instead of a second SSH stack.
+### `agssh-find` — recursive grep
 
-## Non-goals
+```python
+agssh-find(host="db1", pattern="listen_addresses", path="/etc/postgresql",
+           file_glob="*.conf", context=2, limit=50)
+```
 
-No sftp or file sync, no port forwarding, no remote policy engine, no PTY, no background jobs in
-v1, no second SSH implementation, no new config format.
+Remote `grep -n -E -r`. `path` defaults to the host's `default_workdir`; `context` max 20; `limit`
+max 200 matching lines. A no-match grep returns `exit_code: 0` with empty output.
 
-## Documentation
+### `agssh-hosts` — list the registry
 
-`agssh-SPEC-EXTREME.md` and the draft it rewrote are kept locally and deliberately **not committed**
-(spec documents are ignored by `.gitignore`). Ask the maintainer if you need them.
+```python
+agssh-hosts()
+```
 
-## Licence
+Registry table (alias, `as_tool`, this session's tool name, socket state, boot errors, notes) plus
+`Host` aliases discovered in `~/.ssh/config` that are not registered yet. No arguments; makes no
+connection.
 
-Not yet chosen.
+## Safety model
+
+- **Hardline commands are refused outright**, using the same classification Hermes applies to
+  terminal commands — what a terminal would never run is never run remotely.
+- **Dangerous commands escalate to the same human approval gate** Hermes terminal commands use
+  (session/permanent allowlists, CLI prompt, gateway pending). Approval inheritance: agssh does not
+  invent a second approval system, and any failure of the approval path fails closed.
+- **Raw `ssh` to registered hosts is blocked.** A `pre_tool_call` hook vetoes `terminal` commands
+  whose ssh destination names a registered host, so remote exit codes and the audit trail stay
+  honest. Disable with `plugins.entries.agssh.settings.block_raw_ssh: false`.
+- **No pty** means password and host-key prompts fail fast instead of hanging the agent.
+- **Boot validation** drops malformed aliases and unreadable or group/world-readable private keys
+  before any tool is registered for them.
+
+## Limitations
+
+- Requires an OpenSSH client and key-based auth on every registered host; there are no password
+  prompts — a host that demands one fails rather than waits.
+- Requires Hermes with plugin support (tool/hook registration, entry settings).
+- Commands run as the registry entry's user, with that user's remote privileges; there is no
+  additional privilege boundary.
+- The raw-ssh block is a policy guard, not a sandbox: `scp`, `sftp`, nested shells and other
+  transports bypass it.
+- The audit log is best-effort local JSONL — not tamper-proof, and nothing is logged remote-side.
+- No file transfer, no port forwarding, no pty, no background jobs.
+- The plugin deliberately imports three private Hermes modules (approval classification, the
+  approval gate, output redaction); each fails closed when absent. See `docs/PUBLIC-SURFACE.md`.
+
+## Local per-host mode
+
+`plugins.entries.agssh.settings.per_host_tools: true` registers one `agssh-<alias>` tool per host
+(up to 10 tool hosts; above that it falls back to the generic tool). The model then picks a tool
+name instead of passing a `host` argument.
+
+This is a local-only convenience mode: the registered tool names vary per install, so it cannot
+pass catalog validation. The default generic mode always exposes exactly the four declared tools,
+and is what catalog installs run.
+
+## Development and testing
+
+```
+python -m pytest tests/
+```
+
+The suite is unit plus acceptance tests; it stubs the Hermes import surface and exercises the
+vendored executor under an isolated `HERMES_HOME`. Integration tests that need a real SSH host run
+only when `AGSSH_TEST_HOST` names an alias in your live registry:
+
+```
+AGSSH_TEST_HOST=web1 python -m pytest tests/
+```
+
+Host details never live in the repo — the alias is resolved from `~/.config/agssh/hosts.json` at
+run time.
+
+## License
+
+MIT — see `LICENSE`.

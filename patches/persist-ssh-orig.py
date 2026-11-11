@@ -11,7 +11,7 @@ Why this exists:
 
     ControlMaster multiplexing reuses ONE TCP connection for all commands, so it
     never consumes a new sshd auth slot. This script wraps that pattern: setup,
-    run, list, close - with a host registry so aliases like `fatpms3` just work.
+    run, list, close - with a host registry so aliases like `web1` just work.
 
 Stdlib only (argparse, subprocess, json, glob). No pip installs.
 
@@ -25,7 +25,7 @@ Usage:
     persist-ssh.py fetch <name> <remote> <local>  # download via the shared socket
     persist-ssh.py add-host <name> --host IP [--user U] [--key K] [--port P]
 
-Config: ~/.config/persist-ssh.json (auto-seeded with the fat proxies on first run).
+Config: ~/.config/persist-ssh.json (auto-created empty on first run).
 Env override: PERSIST_SSH_CONFIG=/path/to/config.json
 """
 
@@ -41,44 +41,8 @@ CONFIG_PATH = os.environ.get(
     "PERSIST_SSH_CONFIG", os.path.expanduser("~/.config/persist-ssh.json")
 )
 
-# Auto-seeded on first run so the fat proxies work with zero setup.
-# Edit ~/.config/persist-ssh.json to add your own hosts.
-DEFAULT_SEED = {
-    "hosts": {
-        "fatp015": {
-            "host": "132.145.20.34",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-        "fatpms3": {
-            "host": "141.147.111.247",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy_2",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-        "acct3": {
-            "host": "140.238.102.148",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy_3",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-        "fatpsyk": {
-            "host": "140.238.97.70",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy_4",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-    }
-}
+# Created empty on first run; use `agssh add-host` to register hosts.
+DEFAULT_SEED = {"hosts": {}}
 
 
 def load_config():
@@ -86,7 +50,7 @@ def load_config():
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w") as f:
             json.dump(DEFAULT_SEED, f, indent=2)
-        print(f"[persist-ssh] created {CONFIG_PATH} (seeded with fat proxies)")
+        print(f"[persist-ssh] created {CONFIG_PATH}")
     with open(CONFIG_PATH) as f:
         return json.load(f)
 

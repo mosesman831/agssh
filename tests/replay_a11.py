@@ -1,8 +1,10 @@
 """A11 replay harness for the amended agssh spec (agssh-SPEC-EXTREME.md §12).
 
 Pure-stdlib, pytest-free module: constants and pure functions the acceptance
-test file calls to replay the 2026-10-30 session corpus through the executor
-at ``src/executor/persist_ssh_ext.py``.
+test file calls to replay the synthetic corpus through the executor at
+``plugin/agssh/executor.py``. The corpus was real session evidence until
+M5; it now ships generic infrastructure vocabulary only (see
+tests/fixtures/replay_corpus.jsonl).
 
     FIXTURE_PATH / load_corpus        committed JSONL replay corpus
     DANGEROUS_SUBSTRINGS              spec §12 skip list
@@ -13,7 +15,8 @@ at ``src/executor/persist_ssh_ext.py``.
     READSEARCH_VERBS / iter_pipelines A11.4 read/search lane splitting
     is_readsearch / route_segment     pipeline -> agssh-read/-find call
     route_row / route_calls           per-row read/search lane map
-    FIXTURE_TREE / tree_write_argv    /tmp/agssh-a11 fixture tree on fatpsyk
+    FIXTURE_TREE / tree_write_argv    /tmp/agssh-a11 fixture tree on the
+                                      AGSSH_TEST_HOST integration host
     remap_path / route_to_call        corpus paths -> fixture tree paths
 
 The module never runs commands itself; the test file owns execute().
@@ -26,7 +29,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "replay_corpus.jsonl"
-EXECUTOR_PATH = REPO_ROOT / "src" / "executor" / "persist_ssh_ext.py"
+EXECUTOR_PATH = REPO_ROOT / "plugin" / "agssh" / "executor.py"
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +78,11 @@ def load_corpus(path=FIXTURE_PATH):
 DANGEROUS_SUBSTRINGS = ("rm -rf", "mkfs", "shutdown", "reboot", "dd ",
                       "> /dev/")
 
-# Stricter test-host policy applied on top of the spec skip list. fatpsyk is
-# an integration host, not a scratch VM: replay tolerates read-only probes
-# and writes under /tmp only. Anything that mutates system state, package
-# state, docker state, or files outside /tmp classifies "policy" and is not
-# executed.
+# Stricter test-host policy applied on top of the spec skip list. The
+# AGSSH_TEST_HOST machine is an integration host, not a scratch VM: replay
+# tolerates read-only probes and writes under /tmp only. Anything that
+# mutates system state, package state, docker state, or files outside /tmp
+# classifies "policy" and is not executed.
 POLICY_PATTERNS = [
     re.compile(r"\bsudo\b"),
     re.compile(r"\bdocker\b"),
@@ -104,7 +107,7 @@ def classify_row(row):
 
     flagged    - corpus row has skip: true
     dangerous  - command contains a spec §12 skip substring
-    policy     - command trips the stricter fatpsyk test-host policy
+    policy     - command trips the stricter test-host policy
     exec       - safe to replay on the test host
     """
     if row.get("skip"):
@@ -627,68 +630,69 @@ def route_row(command):
 
 
 # ---------------------------------------------------------------------------
-# Fixture tree on fatpsyk (item 7)
+# Fixture tree on the integration host (item 7)
 # ---------------------------------------------------------------------------
 
 TREE_DIR = "/tmp/agssh-a11"
 
 # Small files (<2KB each) letting routed read/find calls succeed on the
 # integration host. Everything lives under /tmp/agssh-a11/ per the test-host
-# policy (read-only probes + /tmp writes only).
+# policy (read-only probes + /tmp writes only). Contents are synthetic,
+# matching the corpus vocabulary.
 FIXTURE_TREE = {
     TREE_DIR + "/docker-compose.yml":
         "services:\n"
         "  web:\n"
-        "    image: interleaved:staging-partlevel3\n"
+        "    image: myapp:staging-partlevel3\n"
         "    restart: unless-stopped\n"
         "    ports:\n"
         "      - \"3001:3000\"\n"
         "    env_file:\n"
         "      - override.env\n"
         "  worker:\n"
-        "    image: interleaved:staging-partlevel3\n"
+        "    image: myapp:staging-partlevel3\n"
         "    env_file:\n"
         "      - override.env\n",
     TREE_DIR + "/override.env":
-        "AI_MODEL_CHEAP=kilo/nvidia/nemotron-3-ultra-550b-a55b:free\n"
-        "AI_MODEL_SECOND=kilo/nvidia/nemotron-3.5-super-vl:free\n"
+        "AI_MODEL_CHEAP=vendor/model-k-free\n"
+        "AI_MODEL_SECOND=vendor/model-c-free\n"
         "AI_MAX_PARALLEL=60\n"
         "AI_MAX_PARALLEL_PER_PROVIDER=30\n"
         "GEN_CONCURRENCY=60\n"
         "MAX_RUN_QUESTIONS=300\n",
     TREE_DIR + "/app.log":
-        "2026-10-30T14:02:11Z INFO  generation run started"
-        " runId=9e93033f-b03c\n"
-        "2026-10-30T14:02:19Z WARN  provider latency high"
-        " model=glm-5.3-flash-free\n"
-        "2026-10-30T14:02:41Z ERROR Upstream error from Nvidia: 429"
+        "2030-01-01T10:02:11Z INFO  task run started"
+        " runId=0f6b4d7a-2c8e\n"
+        "2030-01-01T10:02:19Z WARN  provider latency high"
+        " model=model-i-free\n"
+        "2030-01-01T10:02:41Z ERROR Upstream error from provider: 429"
         " rate_limit exceeded maxRetries=3\n"
-        "2026-10-30T14:02:44Z WARN  retrying request attempt=2 backoff=4s\n"
-        "2026-10-30T14:03:02Z ERROR task failed type=long_answer"
+        "2030-01-01T10:02:44Z WARN  retrying request attempt=2 backoff=4s\n"
+        "2030-01-01T10:03:02Z ERROR task failed type=long_answer"
         " reason=timeout\n"
-        "2026-10-30T14:03:15Z INFO  generation run complete kept=241"
+        "2030-01-01T10:03:15Z INFO  task run complete kept=241"
         " rejected=59\n",
     TREE_DIR + "/burst.json":
-        '{"slug":"aqa-alevel-physics","nodeIds":["n_el_fields",'
-        '"n_capacitance","n_shm","n_thermal","n_waves","n_particles"],'
+        '{"slug":"bench-synthetic","nodeIds":["n_alpha",'
+        '"n_beta","n_gamma","n_delta","n_epsilon","n_zeta"],'
         '"countPerTopic":50,"marksMin":3,"marksMax":9,"count":300}\n',
     TREE_DIR + "/q2.json":
         '{"items":[{"type":"long_answer","marks":6,'
-        '"createdAt":"2026-10-30T12:00:00Z",'
-        '"modelAnswer":"Uses F = BIL for the force on the rod.",'
-        '"stem":"Explain how the motor effect launches the rod.",'
-        '"markScheme":{"points":[{"marks":2,"text":"Fleming left-hand rule"},'
-        '{"marks":2,"text":"current x field gives force"},'
-        '{"marks":2,"text":"links force to acceleration"}]},'
+        '"createdAt":"2030-01-01T09:00:00Z",'
+        '"modelAnswer":"Applies the bench scoring rule to the sample.",'
+        '"stem":"Explain the synthetic scoring step for the sample.",'
+        '"markScheme":{"points":[{"marks":2,"text":"states the rule"},'
+        '{"marks":2,"text":"applies the rule to the sample"},'
+        '{"marks":2,"text":"links the rule to the outcome"}]},'
         '"parts":[{"label":"a","marks":3,"commandWord":"Explain",'
-        '"format":"structured","solution":"...","specNodeId":"n_fields",'
-        '"source":"past-paper","isAiAssisted":true}]}],"questions":[]}\n',
+        '"format":"structured","solution":"...","specNodeId":"n_alpha",'
+        '"source":"synthetic-set","isAiAssisted":true}]}],"questions":[]}\n',
     TREE_DIR + "/models.json":
-        '{"data":[{"id":"kilo/nvidia/nemotron-3.5-super-vl:free",'
+        '{"data":[{"id":"vendor/model-c-free",'
         '"pricing":{"prompt":"0","completion":"0"}},'
-        '{"id":"glm-5.3-flash-free",'
+        '{"id":"model-i-free",'
         '"pricing":{"prompt":"0.0001","completion":"0.0002"}},'
-        '{"id":"gpt-5.1-mini-free",'
+        '{"id":"model-h-free",'
         '"pricing":{"prompt":"0","completion":"0"}}]}\n',
 }
 
@@ -697,7 +701,7 @@ def tree_write_argv():
     """Shell commands that materialize FIXTURE_TREE via execute().
 
     Each command is <4KB, printf-based, and writes only under
-    /tmp/agssh-a11/ - safe for the fatpsyk test-host policy.
+    /tmp/agssh-a11/ - safe under the test-host policy.
     """
     argv = ["mkdir -p " + TREE_DIR]
     for path, content in FIXTURE_TREE.items():

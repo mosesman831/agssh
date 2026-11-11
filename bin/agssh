@@ -7,9 +7,11 @@ ControlMaster connection per alias.
     agssh read <alias> <path> [--offset N] [--limit N] [--json]
     agssh find <alias> <pattern> [--path DIR] [--glob G] [--context N]
                                  [--limit N] [--json]
+    agssh add-host <alias> --host H [--user U] [--key K] [--port P]
+                   [--workdir D]
     agssh uninstall
 
-Thin CLI over the persist-ssh executor - the same module the agssh plugin
+Thin CLI over the shared executor - the same module the agssh plugin
 loads. execute() returns the envelope dict and never prints or exits; this
 CLI prints envelope["output"] on stdout, envelope["error"] on stderr, and
 exits with the remote exit_code when >= 0, else 255.
@@ -26,7 +28,7 @@ import shlex
 import shutil
 import sys
 
-ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
+ALIAS_RE = re.compile(r"[a-z][a-z0-9-]{0,30}")
 
 # Registry keys agssh adds on top of persist-ssh's own host fields; stripped
 # by `agssh uninstall`.
@@ -39,12 +41,21 @@ usage:
   agssh ls
   agssh read <alias> <path> [--offset N] [--limit N] [--json]
   agssh find <alias> <pattern> [--path DIR] [--glob G] [--context N] [--limit N] [--json]
+  agssh add-host <alias> --host H [--user U] [--key K] [--port P] [--workdir D]
   agssh uninstall
 """
 
 
 def _executor_path():
-    return os.environ.get("AGSSH_EXECUTOR") or os.path.expanduser(
+    """$AGSSH_EXECUTOR, then the plugin's vendored executor, then the
+    persist-ssh skill copy as a last resort."""
+    override = os.environ.get("AGSSH_EXECUTOR")
+    if override:
+        return override
+    vendored = os.path.expanduser("~/.hermes/plugins/agssh/executor.py")
+    if os.path.isfile(vendored):
+        return vendored
+    return os.path.expanduser(
         "~/.hermes/skills/devops/persistent-ssh/scripts/persist-ssh.py")
 
 
@@ -230,6 +241,51 @@ def _remove(path, rmtree_ok=True):
         print(f"not present: {path}")
 
 
+def cmd_add_host(argv):
+    p = argparse.ArgumentParser(
+        prog="agssh add-host",
+        description="Register a host alias in the agssh registry"
+                    " (~/.config/agssh/hosts.json; a legacy"
+                    " ~/.config/persist-ssh.json stays readable). The alias"
+                    " becomes usable after the next session boot.")
+    p.add_argument("alias")
+    p.add_argument("--host", required=True, help="hostname or IP")
+    p.add_argument("--user", default="root")
+    p.add_argument("--key", default="~/.ssh/id_rsa",
+                   help="private key path (must exist, mode 600)")
+    p.add_argument("--port", type=int, default=22)
+    p.add_argument("--workdir", default=None,
+                   help="default_workdir for agssh-find without --path")
+    args = p.parse_args(argv)
+    if not ALIAS_RE.fullmatch(args.alias):
+        die(f"agssh: alias '{args.alias}' rejected: must match"
+            " [a-z][a-z0-9-]{0,30}", 2)
+    if args.alias == "add-host" or args.alias in ("ls", "read", "find",
+                                                  "uninstall"):
+        die(f"agssh: alias '{args.alias}' collides with an agssh verb", 2)
+    ex = get_executor()
+    cfg = ex.load_config()
+    hosts = cfg.setdefault("hosts", {})
+    if args.alias in hosts:
+        die(f"agssh: host '{args.alias}' already exists in the registry", 2)
+    entry = {
+        "host": args.host,
+        "user": args.user,
+        "key": args.key,
+        "port": args.port,
+        "control_persist": 3600,
+        "accept_new": True,
+    }
+    if args.workdir:
+        entry["default_workdir"] = args.workdir
+    hosts[args.alias] = entry
+    ex.save_config(cfg)
+    print(f"added '{args.alias}' ({args.user}@{args.host}:{args.port})"
+          f" to {ex.CONFIG_PATH}")
+    print("available to the agssh tools after the next session boot")
+    return 0
+
+
 def cmd_uninstall(argv):
     p = argparse.ArgumentParser(
         prog="agssh uninstall",
@@ -292,6 +348,8 @@ def main(argv=None):
         return cmd_read(rest)
     if verb == "find":
         return cmd_find(rest)
+    if verb == "add-host":
+        return cmd_add_host(rest)
     if verb == "uninstall":
         return cmd_uninstall(rest)
     return cmd_exec(argv)

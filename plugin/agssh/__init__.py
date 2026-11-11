@@ -1,11 +1,17 @@
-"""agssh — persist-ssh registry hosts as native Hermes tools.
+"""agssh — SSH hosts from the agssh registry as native Hermes tools.
 
 register(ctx) only. Load order: executor -> boot-validate every registry
 host (bad entries are warned, audited via="boot" and skipped, never
-fatal) -> mode switch at 10 validated as_tool hosts (per-host `agssh-<x>`
-tools vs one generic `agssh` with a host enum) -> register the command
-tools plus agssh-read/-find/-hosts -> bind guard state -> pre_tool_call
-hook. agssh-hosts is registered even when the executor file is missing.
+fatal) -> mode pick -> register the command tool(s) plus
+agssh-read/-find/-hosts -> bind guard state -> pre_tool_call hook.
+
+Modes: the default catalog mode always registers the generic `agssh`
+tool (host is an enum of validated aliases, or a plain string when the
+registry is empty) so the declared tool surface never varies. Setting
+plugins.entries.agssh.settings.per_host_tools: true switches to the
+local-only mode: one `agssh-<alias>` tool per host (<=10, generic above)
+— convenient, but a per-install tool list cannot pass catalog
+validation. agssh-hosts is registered even when the executor is missing.
 """
 
 import logging
@@ -81,8 +87,13 @@ def register(ctx):
     # Q4: command tools go only to validated hosts with as_tool != False.
     tool_hosts = {a: i for a, i in validated.items()
                   if (i or {}).get("as_tool", True) != False}
-    mode = ("per-host" if len(tool_hosts) <= GENERIC_HOST_THRESHOLD
-            else "generic")
+    # per_host_tools (default false) selects the local-only per-alias
+    # tools; the default catalog mode always exposes exactly `agssh`.
+    if bool(ctx.get_config("per_host_tools", False)):
+        mode = ("per-host" if len(tool_hosts) <= GENERIC_HOST_THRESHOLD
+                else "generic")
+    else:
+        mode = "generic"
 
     tool_names = {str(alias): None for alias in hosts}
     if mode == "per-host":

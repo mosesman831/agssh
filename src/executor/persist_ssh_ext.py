@@ -11,7 +11,7 @@ Why this exists:
 
     ControlMaster multiplexing reuses ONE TCP connection for all commands, so it
     never consumes a new sshd auth slot. This script wraps that pattern: setup,
-    run, list, close - with a host registry so aliases like `fatpms3` just work.
+    run, list, close - with a host registry so short aliases just work.
 
 Stdlib only (argparse, subprocess, json, glob). No pip installs.
 
@@ -25,8 +25,10 @@ Usage:
     persist-ssh.py fetch <name> <remote> <local>  # download via the shared socket
     persist-ssh.py add-host <name> --host IP [--user U] [--key K] [--port P]
 
-Config: ~/.config/persist-ssh.json (auto-seeded with the fat proxies on first run).
-Env override: PERSIST_SSH_CONFIG=/path/to/config.json
+Config: ~/.config/agssh/hosts.json (created empty on first run; a legacy
+~/.config/persist-ssh.json is merged in read-only when it exists).
+Env override: AGSSH_REGISTRY or PERSIST_SSH_CONFIG=/path/to/config.json
+(an explicit env path disables the legacy merge).
 
 agssh extension (see agssh spec):
     execute() is the library entry point shared by the agssh plugin tools and
@@ -55,48 +57,31 @@ import sys
 import time
 import uuid
 
-CONFIG_PATH = os.environ.get(
-    "PERSIST_SSH_CONFIG", os.path.expanduser("~/.config/persist-ssh.json")
-)
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/agssh/hosts.json")
+# Read-only merge base kept for operators who already ran persist-ssh:
+# when the default primary is used and this file exists, its hosts are
+# visible below the primary's (the primary wins per alias). Never written.
+LEGACY_CONFIG_PATH = os.path.expanduser("~/.config/persist-ssh.json")
 
-# Auto-seeded on first run so the fat proxies work with zero setup.
-# Edit ~/.config/persist-ssh.json to add your own hosts.
-DEFAULT_SEED = {
-    "hosts": {
-        "fatp015": {
-            "host": "132.145.20.34",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-        "fatpms3": {
-            "host": "141.147.111.247",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy_2",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-        "acct3": {
-            "host": "140.238.102.148",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy_3",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-        "fatpsyk": {
-            "host": "140.238.97.70",
-            "user": "ubuntu",
-            "key": "~/.ssh/oci_fat_proxy_4",
-            "port": 22,
-            "control_persist": 3600,
-            "accept_new": True,
-        },
-    }
-}
+_ENV_PATH = (os.environ.get("AGSSH_REGISTRY")
+             or os.environ.get("PERSIST_SSH_CONFIG"))
+CONFIG_PATH = os.path.expanduser(_ENV_PATH) if _ENV_PATH \
+    else DEFAULT_CONFIG_PATH
+# The legacy merge only applies to the default primary; an explicit env
+# path means full control (tests point it at a temp registry).
+_LEGACY_MERGE = not _ENV_PATH
+
+# Empty seed: a fresh install owns no hosts. `agssh add-host` writes here.
+DEFAULT_SEED = {"hosts": {}}
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def load_config():
@@ -104,9 +89,15 @@ def load_config():
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w") as f:
             json.dump(DEFAULT_SEED, f, indent=2)
-        print(f"[persist-ssh] created {CONFIG_PATH} (seeded with fat proxies)")
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    cfg = _read_json(CONFIG_PATH)
+    if _LEGACY_MERGE and LEGACY_CONFIG_PATH != CONFIG_PATH:
+        legacy = _read_json(LEGACY_CONFIG_PATH)
+        if legacy:
+            merged = dict(legacy.get("hosts") or {})
+            merged.update(cfg.get("hosts") or {})
+            cfg["hosts"] = merged
+    cfg.setdefault("hosts", {})
+    return cfg
 
 
 def save_config(cfg):

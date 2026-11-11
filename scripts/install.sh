@@ -10,7 +10,10 @@ PATCH_FILE="$REPO/patches/persist-ssh-execute.patch"
 REJ=/tmp/persist-ssh-patch.rej
 
 patched=no
-if grep -q "^def execute(" "$SKILL" 2>/dev/null; then
+if [ ! -f "$SKILL" ]; then
+    echo "persist-ssh skill not installed - skipping patch" \
+         "(the plugin uses its own vendored executor)"
+elif grep -q "^def execute(" "$SKILL" 2>/dev/null; then
     echo "persist-ssh.py: already patched"
 else
     if patch --backup-if-mismatch -r "$REJ" "$SKILL" < "$PATCH_FILE"; then

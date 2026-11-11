@@ -26,10 +26,18 @@ MODE = None        # "per-host" | "generic" | None
 
 
 def executor_path():
-    """Executor file path: $AGSSH_EXECUTOR or the persist-ssh skill copy."""
-    return (os.environ.get("AGSSH_EXECUTOR")
-            or os.path.expanduser(
-                "~/.hermes/skills/devops/persistent-ssh/scripts/persist-ssh.py"))
+    """Executor file path: $AGSSH_EXECUTOR, then the vendored sibling
+    executor.py (self-contained default), then the persist-ssh skill copy
+    as a last resort."""
+    override = os.environ.get("AGSSH_EXECUTOR")
+    if override:
+        return override
+    vendored = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "executor.py")
+    if os.path.isfile(vendored):
+        return vendored
+    return os.path.expanduser(
+        "~/.hermes/skills/devops/persistent-ssh/scripts/persist-ssh.py")
 
 
 def load_executor():
@@ -86,11 +94,19 @@ def _command_parameters(host_enum=None):
     props = {}
     required = []
     if host_enum is not None:
-        props["host"] = {
-            "type": "string",
-            "enum": list(host_enum),
-            "description": "Registry alias of the remote host",
-        }
+        if host_enum:
+            props["host"] = {
+                "type": "string",
+                "enum": list(host_enum),
+                "description": "Registry alias of the remote host",
+            }
+        else:
+            props["host"] = {
+                "type": "string",
+                "description": ("Registry alias of the remote host "
+                                "(no hosts configured yet — run `agssh "
+                                "add-host <alias> --host H --key K` first)"),
+            }
         required.append("host")
     props["command"] = {
         "type": "string",
@@ -127,25 +143,36 @@ def host_tool_schema(alias, info):
             "background jobs: interactive prompts fail rather than hang. "
             "workdir is per-call, never sticky. Do not append pipes or "
             "tail: exit_code is the remote status. Registry edits need a "
-            "new session; new hosts: `persist-ssh add-host` then a new "
+            "new session; new hosts: `agssh add-host` then a new "
             "session."),
         "parameters": _command_parameters(),
     }
 
 
 def generic_tool_schema(aliases):
-    """Single `agssh` schema (generic mode, > 10 tool hosts): host enum."""
-    return {
-        "name": "agssh",
-        "description": (
+    """Single `agssh` schema (catalog mode default / >10 tool hosts):
+    host is a JSON Schema enum of validated aliases, or a plain string
+    with an onboarding hint when the registry is empty."""
+    if aliases:
+        desc = (
             "Run a shell command on a registered SSH host (host picks the "
             "registry alias). Byte-exact command transmission, real remote "
             "exit code, output capped at 96k chars. No pty, no background "
             "jobs: interactive prompts fail rather than hang. workdir is "
             "per-call, never sticky. Do not append pipes or tail: "
             "exit_code is the remote status. Registry edits need a new "
-            "session; new hosts: `persist-ssh add-host` then a new "
-            "session."),
+            "session; new hosts: `agssh add-host` then a new session.")
+    else:
+        desc = (
+            "Run a shell command on a registered SSH host. No hosts are "
+            "configured yet: add one with `agssh add-host <alias> --host H "
+            "--user U --key K` (or `agssh-hosts` to see aliases your "
+            "~/.ssh/config already names), then start a new session. "
+            "Byte-exact command transmission, real remote exit code, "
+            "output capped at 96k chars. No pty, no background jobs.")
+    return {
+        "name": "agssh",
+        "description": desc,
         "parameters": _command_parameters(host_enum=list(aliases)),
     }
 
@@ -207,9 +234,10 @@ FIND_SCHEMA = {
 HOSTS_SCHEMA = {
     "name": "agssh-hosts",
     "description": (
-        "List the persist-ssh registry: alias, as_tool, the command tool "
+        "List the agssh host registry: alias, as_tool, the command tool "
         "registered this session, boot errors, ControlMaster socket state "
-        "and notes. Makes no connection."),
+        "and notes; then Host aliases discovered in ~/.ssh/config that are "
+        "not registered yet (read-only). Makes no connection."),
     "parameters": {"type": "object", "properties": {}},
 }
 
@@ -405,9 +433,31 @@ def _render_table(headers, rows):
     return "\n".join(lines)
 
 
+def _ssh_config_aliases():
+    """Host aliases from ~/.ssh/config (and missing-file tolerant).
+
+    `Host` entries name connection profiles a user already maintains;
+    wildcard patterns (* ?) and negations are skipped since they are not
+    addable aliases. Read-only: nothing here is registered or connected."""
+    path = os.path.expanduser("~/.ssh/config")
+    aliases = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                words = line.split()
+                if len(words) >= 2 and words[0].lower() == "host":
+                    for alias in words[1:]:
+                        if not any(c in alias for c in "*?!"):
+                            aliases.append(alias)
+    except OSError:
+        return []
+    return aliases
+
+
 def handle_hosts(args, **kwargs):
     """agssh-hosts: registry table (alias, as_tool, this session's tool
-    name, boot error, socket state, notes). Makes no connection."""
+    name, boot error, socket state, notes), then unregistered
+    ~/.ssh/config Host aliases. Makes no connection."""
     try:
         if EX is None:
             return _json(_envelope(output=f"executor missing: {EX_PATH}",
@@ -431,6 +481,11 @@ def handle_hosts(args, **kwargs):
         output = _render_table(
             ["alias", "as_tool", "tool", "socket", "boot_error", "notes"],
             rows)
+        discovered = [a for a in _ssh_config_aliases() if a not in hosts]
+        if discovered:
+            output += ("\n\n~/.ssh/config Host aliases (not registered — "
+                       "`agssh add-host <alias> --host H` to add):\n  "
+                       + "\n  ".join(sorted(discovered)))
         return _json(apply_model_cap(
             _envelope(output=output, exit_code=0, host="")))
     except Exception as exc:

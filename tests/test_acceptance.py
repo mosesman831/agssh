@@ -1,27 +1,33 @@
 """Acceptance tests for the agssh build spec, section 12.
 
-A11 (amended 2026-10-31) replays the 2026-10-30 session's remote ssh
-payloads (committed fixture ``tests/fixtures/replay_corpus.jsonl``) and
+A11 (amended 2026-10-31) replays the synthetic command corpus (committed
+fixture ``tests/fixtures/replay_corpus.jsonl`` — the command structures
+of a real session, with generic infrastructure vocabulary since M5) and
 asserts four clauses: A11.1 zero quoting failures against a ``bash -lc``
-baseline run on fatpsyk itself, A11.2 tool-path exit-code fidelity,
-A11.3 structural absence of transport in every executed model-authored
-command, and A11.4 the read/search lane measured in calls-per-intent.
-The word-count ratio is withdrawn by the spec and gone from this test.
+baseline run on the AGSSH_TEST_HOST host itself, A11.2 tool-path
+exit-code fidelity, A11.3 structural absence of transport in every
+executed model-authored command, and A11.4 the read/search lane measured
+in calls-per-intent. The word-count ratio is withdrawn by the spec and
+gone from this test. A11 drives real remote commands, so it carries
+``@requires_host`` — with AGSSH_TEST_HOST unset it collects and skips
+cleanly.
 
-A12 boots the plugin against a temp registry: bad aliases and bad keys are
-skipped, good hosts register ``agssh-<alias>``.
+A12 boots the plugin against a temp registry seeded from the
+AGSSH_TEST_HOST registry entry: bad aliases and bad keys are skipped,
+good hosts register ``agssh-<alias>``.
 
 A18 runs ``bin/agssh uninstall`` in a fully sandboxed HOME/HERMES_HOME so it
 can never touch real state.
 
-The prod-host refusal in A11 runs before anything else: alias ``fat1``, host
-``140.238.98.44``, or notes ``interleaved prod`` in the registry or the corpus
-halts the entire run (that machine is Interleaved production, not a test
-target).
+The prod-host refusal in A11 runs before anything else: alias ``fat1``,
+the ``AGSSH_PROD_IP`` host, or notes containing ``prod`` in the registry
+or the corpus halts the entire run (that machine is production, not a
+test target). The production IP never lives in a tracked file — the
+operator exports AGSSH_PROD_IP; unset, the IP checks are simply inert.
 
 Fixtures come from tests/conftest.py: ``ex`` (the executor module),
-``tmp_registry``, ``fake_ctx``, ``prod_guard`` (autouse) and ``HOST_FATPSYK``.
-The repo ``plugin/`` directory is on sys.path.
+``tmp_registry``, ``fake_ctx``, ``prod_guard`` (autouse), ``test_host``
+and ``requires_host``. The repo ``plugin/`` directory is on sys.path.
 """
 
 import importlib
@@ -35,14 +41,18 @@ from pathlib import Path
 
 import pytest
 
+from conftest import TEST_ALIAS, requires_host
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXECUTOR_PATH = REPO_ROOT / "src" / "executor" / "persist_ssh_ext.py"
+EXECUTOR_PATH = REPO_ROOT / "plugin" / "agssh" / "executor.py"
 BIN_AGSSH = REPO_ROOT / "bin" / "agssh"
 
-# The one host A11 must never run against (spec section 9 / 12).
+# The one host A11 must never run against (spec section 9 / 12). The
+# production IP is supplied via AGSSH_PROD_IP on the operator's box so it
+# never lives in a tracked file; unset, the IP checks are inert.
 PROD_ALIAS = "fat1"
-PROD_IP = "140.238.98.44"
-PROD_NOTES = "interleaved prod"
+PROD_IP = os.environ.get("AGSSH_PROD_IP", "")
+PROD_NOTES = "prod"
 
 CORPUS_ENV = "AGSSH_REPLAY_CORPUS"
 DEFAULT_CORPUS = REPO_ROOT / "tests" / "fixtures" / "replay_corpus.jsonl"
@@ -68,7 +78,7 @@ def _prod_refusal(ex, corpus_text):
     """Scan the registry and (when present) the raw corpus for the prod host.
 
     Runs before any corpus handling: a hit exits the whole pytest run rather
-    than failing a single test, because replaying onto Interleaved prod is an
+    than failing a single test, because replaying onto production is an
     incident, not a test result.
     """
     try:
@@ -82,17 +92,17 @@ def _prod_refusal(ex, corpus_text):
     for alias, info in hosts.items():
         if not isinstance(info, dict):
             continue
-        if str(info.get("host", "")) == PROD_IP:
+        if PROD_IP and str(info.get("host", "")) == PROD_IP:
             pytest.exit(
                 f"A11 refuses to run: registry host '{alias}' is {PROD_IP}")
-        if PROD_NOTES in str(info.get("notes", "")):
+        if PROD_NOTES in str(info.get("notes", "")).lower():
             pytest.exit(
                 f"A11 refuses to run: registry host '{alias}' notes contain"
                 f" '{PROD_NOTES}'")
     if corpus_text:
-        if PROD_IP in corpus_text:
+        if PROD_IP and PROD_IP in corpus_text:
             pytest.exit(f"A11 refuses to run: corpus mentions {PROD_IP}")
-        if PROD_NOTES in corpus_text:
+        if PROD_NOTES in corpus_text.lower():
             pytest.exit(
                 f"A11 refuses to run: corpus mentions '{PROD_NOTES}'")
         if re.search(r"(?<![a-z0-9-])fat1(?![a-z0-9-])", corpus_text):
@@ -101,7 +111,7 @@ def _prod_refusal(ex, corpus_text):
 
 
 def _remote_baseline(ex, command, info):
-    """A direct `bash -lc` of the same string on fatpsyk, over raw ssh.
+    """A direct `bash -lc` of the same string on the test host, over raw ssh.
 
     This is the independent reference for A11.1: same host, same inputs,
     so the only legitimate byte differences are volatile tokens (masked by
@@ -115,7 +125,7 @@ def _remote_baseline(ex, command, info):
         # connections would MaxStartups-exhaust sshd (the very failure
         # mode the tool exists to prevent).
         "-o", "ControlMaster=no",
-        "-o", f"ControlPath={ex.control_path('fatpsyk', info)}",
+        "-o", f"ControlPath={ex.control_path(TEST_ALIAS, info)}",
         "-i", os.path.expanduser(info["key"]),
         "-p", str(info.get("port", 22)),
         f"{info['user']}@{info['host']}",
@@ -138,7 +148,7 @@ def _cli_exit(command):
     env["AGSSH_EXECUTOR"] = str(EXECUTOR_PATH)
     try:
         proc = subprocess.run(
-            [sys.executable, str(BIN_AGSSH), "fatpsyk", "--", command],
+            [sys.executable, str(BIN_AGSSH), TEST_ALIAS, "--", command],
             capture_output=True, text=True, timeout=BASELINE_TIMEOUT_S,
             env=env)
     except subprocess.TimeoutExpired:
@@ -147,7 +157,7 @@ def _cli_exit(command):
 
 
 def _handler_exit(ex, ctx):
-    """The agent tool path: the registered agssh-fatpsyk handler's exit_code,
+    """The agent tool path: the registered agssh-<alias> handler's exit_code,
     or 'denied' when guard_command vetoes the row (approval absent in test
     env)."""
     tools = getattr(ctx, "tools", []) or []
@@ -155,7 +165,7 @@ def _handler_exit(ex, ctx):
     for tool in tools:
         name = tool.get("name") if isinstance(tool, dict) else getattr(
             tool, "name", None)
-        if name == "agssh-fatpsyk":
+        if name == f"agssh-{TEST_ALIAS}":
             handler = tool.get("handler") if isinstance(tool, dict) else getattr(
                 tool, "handler", None)
             break
@@ -176,7 +186,8 @@ def _handler_exit(ex, ctx):
     return _call
 
 
-def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
+@requires_host
+def test_a11_replay_corpus(ex, prod_guard, fake_ctx, test_host):
     import replay_a11 as ra
 
     corpus_env = os.environ.get(CORPUS_ENV)
@@ -208,11 +219,9 @@ def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
     if not rows:
         pytest.fail("A11 fails closed: corpus has no rows")
 
-    cfg = ex.load_config()
-    info = cfg.get("hosts", {}).get("fatpsyk")
-    assert info, "fatpsyk missing from registry"
+    info = test_host
     assert os.path.exists(os.path.expanduser(info["key"])), \
-        "fatpsyk key missing from disk"
+        f"{TEST_ALIAS} key missing from disk"
 
     classes = {i: ra.classify_row(r) for i, r in enumerate(rows)}
     exec_rows = [(i, r) for i, r in enumerate(rows) if classes[i] == "exec"]
@@ -221,12 +230,14 @@ def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
         counts[cls] = counts.get(cls, 0) + 1
     assert exec_rows, "no executable rows in corpus"
 
-    # A11.4 fixture tree on fatpsyk (tiny, /tmp only).
+    # A11.4 fixture tree on the test host (tiny, /tmp only).
     for write_cmd in ra.tree_write_argv():
-        env = ex.execute("fatpsyk", write_cmd, timeout_s=30)
+        env = ex.execute(TEST_ALIAS, write_cmd, timeout_s=30)
         assert env["exit_code"] == 0, (
             f"A11.4 fixture write failed: {env.get('error') or env['output']}")
 
+    # A11.2 exercises the per-alias tool: register in per-host mode.
+    fake_ctx.settings["per_host_tools"] = True
     import agssh
     importlib.reload(agssh)
     agssh.register(fake_ctx)
@@ -242,7 +253,7 @@ def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
             if pat in mc:
                 transport_hits.append((index, pat))
 
-        env = ex.execute("fatpsyk", mc, timeout_s=ROW_TIMEOUT_S)
+        env = ex.execute(TEST_ALIAS, mc, timeout_s=ROW_TIMEOUT_S)
         base = _remote_baseline(ex, mc, info)
 
         # A11.1 quoting failures: transport-shaped error, truncation, or
@@ -312,7 +323,7 @@ def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
             if call and call.get("tool") == "agssh-find":
                 argv = ex.find_argv(call["pattern"], call["path"],
                                     call.get("file_glob"), call.get("context", 0))
-                env = ex.execute("fatpsyk", argv, timeout_s=30)
+                env = ex.execute(TEST_ALIAS, argv, timeout_s=30)
                 env = ex.find_result(env, call.get("limit", 50))
                 calls += 1
                 entry.update(tool="agssh-find", exit=env["exit_code"],
@@ -320,7 +331,7 @@ def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
             elif call and call.get("tool") == "agssh-read":
                 argv = ex.read_argv(call["path"], call.get("offset", 1),
                                     call.get("limit", 2000))
-                env = ex.execute("fatpsyk", argv, timeout_s=30)
+                env = ex.execute(TEST_ALIAS, argv, timeout_s=30)
                 calls += 1
                 entry.update(tool="agssh-read", exit=env["exit_code"],
                              lines=len(env["output"].splitlines()))
@@ -330,6 +341,8 @@ def test_a11_replay_corpus(ex, prod_guard, fake_ctx):
             mapping.append(entry)
 
     evidence = {
+        "corpus": "synthetic",
+        "host": TEST_ALIAS,
         "rows": len(rows), "classes": counts, "executed": len(exec_rows),
         "a11_1": {"quoting_failures": len(quoting_failures),
                   "byte_diffs": byte_diffs,
@@ -388,20 +401,24 @@ def _tool_names(fake_ctx, captured):
     return names
 
 
-def test_a12_boot_validation(ex, tmp_registry, fake_ctx, host_fatpsyk,
+@requires_host
+def test_a12_boot_validation(ex, tmp_registry, fake_ctx, test_host,
                              monkeypatch, tmp_path):
     # (a) alias rule, same table as U3.
     assert not ex.valid_alias("fat.1"), "'fat.1' must be rejected"
     assert not ex.valid_alias("9foo"), "'9foo' must be rejected"
     assert ex.valid_alias("fat1"), "'fat1' must be accepted"
 
-    # (b) plugin boot of a temp registry. '9bad' carries otherwise-valid
-    # fields so only the alias can sink it; 'nokey' only the missing key.
+    # (b) plugin boot of a temp registry seeded from the AGSSH_TEST_HOST
+    # entry. '9bad' carries otherwise-valid fields so only the alias can
+    # sink it; 'nokey' only the missing key. Per-host mode is what turns a
+    # validated alias into an agssh-<alias> tool.
+    fake_ctx.settings["per_host_tools"] = True
     good_key = tmp_path / "a12-key"
     good_key.write_text("a12 placeholder key\n")
     good_key.chmod(0o600)
     hosts = {
-        "fatpsyk": dict(host_fatpsyk),
+        TEST_ALIAS: dict(test_host),
         "9bad": {"host": "192.0.2.9", "user": "ubuntu",
                  "key": str(good_key), "port": 22},
         "nokey": {"host": "192.0.2.10", "user": "ubuntu",
@@ -446,7 +463,8 @@ def test_a12_boot_validation(ex, tmp_registry, fake_ctx, host_fatpsyk,
     agssh.register(fake_ctx)
 
     names = _tool_names(fake_ctx, captured)
-    assert "agssh-fatpsyk" in names, f"registered tools: {sorted(names)}"
+    assert f"agssh-{TEST_ALIAS}" in names, (
+        f"registered tools: {sorted(names)}")
     assert "agssh-hosts" in names, (
         f"agssh-hosts is always registered; got {sorted(names)}")
     assert not any("9bad" in n for n in names), (
@@ -473,7 +491,7 @@ def test_a18_uninstall(tmp_path):
     logs_dir = fakehermes / "logs"
     logs_dir.mkdir(parents=True)
     (logs_dir / "agssh.log").write_text(
-        "2026-10-30T00:00:00+00:00 fatpsyk 0 1 1 false tool pwd\n")
+        "2030-01-01T00:00:00+00:00 benchbox 0 1 1 false tool pwd\n")
     (logs_dir / "agssh.log.1").write_text("rotated\n")
     (logs_dir / "agssh.log.lock").write_text("")
     cache_dir = fakehermes / "cache" / "agssh"
@@ -482,17 +500,17 @@ def test_a18_uninstall(tmp_path):
     ssh_dir = fakehome / ".ssh"
     ssh_dir.mkdir(parents=True)
     # persist-ssh's sockets and locks are not agssh's to remove (spec 13).
-    cm_socket = ssh_dir / "cm-fatpsyk-ubuntu@140.238.97.70:22"
-    cm_lock = ssh_dir / "cm-fatpsyk.lock"
+    cm_socket = ssh_dir / "cm-benchbox-ubuntu@192.0.2.70:22"
+    cm_lock = ssh_dir / "cm-benchbox.lock"
     cm_socket.write_text("control socket placeholder")
     cm_lock.write_text("lock placeholder")
 
     registry_path.write_text(json.dumps({
         "hosts": {
-            "fatpsyk": {
-                "host": "140.238.97.70",
+            "benchbox": {
+                "host": "192.0.2.70",
                 "user": "ubuntu",
-                "key": "~/.ssh/oci_fat_proxy_4",
+                "key": "~/.ssh/benchbox_key",
                 "port": 22,
                 "control_persist": 3600,
                 "accept_new": True,
@@ -537,7 +555,7 @@ def test_a18_uninstall(tmp_path):
                 f"{alias}: agssh key '{key}' survived uninstall")
         for key in BASE_HOST_KEYS:
             assert key in info, f"{alias}: base key '{key}' was stripped"
-    assert "fatpsyk" in after.get("hosts", {}), "uninstall removed a host"
+    assert "benchbox" in after.get("hosts", {}), "uninstall removed a host"
 
     assert "next session" in proc.stdout.lower(), (
         "uninstall must report that loaded tools remain until the next"

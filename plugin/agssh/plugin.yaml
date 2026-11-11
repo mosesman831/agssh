@@ -1,5 +1,16 @@
 name: agssh
-version: 1.0.0
-description: "SSH hosts as native tools: per-host command tools plus read/find/hosts, one registry shared with the persist-ssh CLI, real remote exit codes."
+version: 1.1.0
+description: "SSH hosts as native agent tools: run commands, read and search remote files over one persistent multiplexed connection per host, with real remote exit codes and an approval-gated command surface."
+provides_tools: [agssh, agssh-read, agssh-find, agssh-hosts]
 provides_hooks: [pre_tool_call]
-provides_tools: [agssh-read, agssh-find, agssh-hosts]
+config_schema:
+  per_host_tools:
+    type: bool
+    default: false
+    description: "Register one agssh-<alias> tool per host instead of the single generic agssh tool. Local-only convenience mode; catalog installs keep the default."
+  block_raw_ssh:
+    type: bool
+    default: true
+    description: "Block terminal ssh calls to hosts that have an agssh tool, so commands keep remote exit codes and audit."
+license: MIT
+tags: [ssh, devops, remote, terminal]

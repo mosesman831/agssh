@@ -24,8 +24,31 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR = os.path.join(REPO_ROOT, "plugin")
 HERMES_AGENT_DIR = os.path.expanduser("~/.hermes/hermes-agent")
-LIVE_REGISTRY_PATH = os.path.expanduser("~/.config/persist-ssh.json")
-DEFAULT_EXECUTOR_PATH = os.path.join(REPO_ROOT, "src", "executor", "persist_ssh_ext.py")
+LIVE_REGISTRY_PATHS = (
+    os.path.expanduser("~/.config/agssh/hosts.json"),
+    os.path.expanduser("~/.config/persist-ssh.json"),
+)
+# The vendored in-plugin executor is canonical for tests: it is what a
+# fresh install resolves, with no operator skill path required.
+DEFAULT_EXECUTOR_PATH = os.path.join(REPO_ROOT, "plugin", "agssh", "executor.py")
+
+# Integration host parameterisation: tests that need a real SSH host are
+# skipped unless AGSSH_TEST_HOST names an alias in a live registry.
+TEST_ALIAS = os.environ.get("AGSSH_TEST_HOST") or None
+requires_host = pytest.mark.skipif(
+    not TEST_ALIAS,
+    reason="AGSSH_TEST_HOST unset — no integration host configured")
+
+
+def _live_hosts():
+    merged = {}
+    for path in LIVE_REGISTRY_PATHS:
+        try:
+            with open(path) as f:
+                merged.update(json.load(f).get("hosts") or {})
+        except (OSError, ValueError):
+            continue
+    return merged
 
 for _path in (PLUGIN_DIR, HERMES_AGENT_DIR):
     if _path not in sys.path:
@@ -96,13 +119,9 @@ def load_executor(path=None):
     """Load the executor script as a fresh module object.
 
     Resolution order: explicit ``path`` -> ``AGSSH_EXECUTOR`` env ->
-    ``<repo>/src/executor/persist_ssh_ext.py``.
+    the vendored ``plugin/agssh/executor.py``.
     """
-    path = (
-        path
-        or os.environ.get("AGSSH_EXECUTOR")
-        or os.path.join(os.path.dirname(__file__), "..", "src", "executor", "persist_ssh_ext.py")
-    )
+    path = path or os.environ.get("AGSSH_EXECUTOR") or DEFAULT_EXECUTOR_PATH
     path = os.path.abspath(path)
     spec = importlib.util.spec_from_file_location("persist_ssh", path)
     mod = importlib.util.module_from_spec(spec)
@@ -135,14 +154,15 @@ def ex(tmp_path, monkeypatch):
 # plugin's own executor instance) picks the temp registry too.
 # --------------------------------------------------------------------------
 
-HOST_FATPSYK = {
-    "host": "140.238.97.70",
-    "user": "ubuntu",
-    "key": "~/.ssh/oci_fat_proxy_4",
-    "port": 22,
-    "control_persist": 3600,
-    "accept_new": True,
-}
+def test_host_entry():
+    """The AGSSH_TEST_HOST registry entry, read from a live registry.
+
+    Infrastructure details (IPs, key paths) never live in tracked files —
+    they come from the operator's local registry at run time."""
+    if not TEST_ALIAS:
+        return None
+    info = _live_hosts().get(TEST_ALIAS)
+    return copy.deepcopy(info) if isinstance(info, dict) else None
 
 
 class TmpRegistry:
@@ -171,31 +191,34 @@ def tmp_registry(tmp_path, monkeypatch, ex):
 
 
 @pytest.fixture
-def host_fatpsyk():
-    """The seeded integration host entry (a fresh copy per test)."""
-    return copy.deepcopy(HOST_FATPSYK)
+def test_host():
+    """The AGSSH_TEST_HOST registry entry (a fresh copy per test)."""
+    info = test_host_entry()
+    if info is None:
+        pytest.skip("AGSSH_TEST_HOST unset or unknown alias")
+    return info
 
 
 # --------------------------------------------------------------------------
-# Prod-host guard: the integration target is fatpsyk only. fat1 /
-# 140.238.98.44 / "interleaved prod" is live production — refuse the whole run.
+# Prod-host guard: integration targets are dev boxes only. The production
+# alias, a notes field containing "prod", or an operator-supplied
+# AGSSH_PROD_IP refuses the whole run. (The literal production IP must not
+# live in a tracked file - set it via the env var on the operator's box.)
 # --------------------------------------------------------------------------
+
+PROD_ALIAS = "fat1"
+PROD_IP = os.environ.get("AGSSH_PROD_IP", "")
+
 
 @pytest.fixture(autouse=True)
 def prod_guard():
-    try:
-        with open(LIVE_REGISTRY_PATH) as f:
-            hosts = json.load(f).get("hosts", {})
-    except (OSError, ValueError):
-        hosts = {}
+    hosts = _live_hosts()
     for alias, info in hosts.items():
         info = info or {}
         notes = str(info.get("notes") or "")
-        if (
-            alias == "fat1"
-            or info.get("host") == "140.238.98.44"
-            or "interleaved prod" in notes
-        ):
+        if (alias == PROD_ALIAS
+                or (PROD_IP and info.get("host") == PROD_IP)
+                or "prod" in notes.lower()):
             pytest.exit("refusing: prod host in registry")
 
 

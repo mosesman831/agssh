@@ -15,6 +15,7 @@ docs/specs/
 
 # Local/scratch
 node_modules/
+tests/fixtures/replay_corpus.local.jsonl
 .venv/
 venv/
 __pycache__/
