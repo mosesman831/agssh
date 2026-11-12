@@ -250,7 +250,7 @@ def cmd_add_host(argv):
     p = argparse.ArgumentParser(
         prog="agssh add-host",
         description="Register a host alias in the agssh registry"
-                    " (~/.config/agssh/hosts.json; a legacy"
+                    " (<hermes-home>/plugin-data/agssh/hosts.json; a legacy"
                     " ~/.config/persist-ssh.json stays readable). The alias"
                     " becomes usable after the next session boot.")
     p.add_argument("alias")
