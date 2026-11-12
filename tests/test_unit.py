@@ -13,6 +13,7 @@ import importlib.util
 import inspect
 import json
 import os
+import stat
 import shlex
 
 import pytest
@@ -366,25 +367,36 @@ def test_u9_vendored_parity():
 # ---------------------------------------------------------------------------
 
 def test_u10_default_seed_silent(ex, tmp_path, monkeypatch, capsys):
+    """Registry is per profile, loading never creates it, add-host creates
+    it 0600 (maintainer review items 1 and 2)."""
     monkeypatch.delenv("PERSIST_SSH_CONFIG", raising=False)
     monkeypatch.delenv("AGSSH_REGISTRY", raising=False)
 
     assert ex.DEFAULT_SEED == {"hosts": {}}
-    assert ex.DEFAULT_CONFIG_PATH.endswith(
-        os.path.join(".config", "agssh", "hosts.json"))
-    assert "persist-ssh" not in ex.DEFAULT_CONFIG_PATH
+    default = ex._default_config_path()
+    assert default.endswith(
+        os.path.join("plugin-data", "agssh", "hosts.json"))
+    assert "persist-ssh" not in default
+    assert ex._hermes_home() in default
 
     primary = tmp_path / "fresh" / "agssh" / "hosts.json"
     monkeypatch.setattr(ex, "CONFIG_PATH", str(primary))
-    monkeypatch.setattr(ex, "LEGACY_CONFIG_PATH",
-                        str(tmp_path / "absent-legacy.json"))
+    monkeypatch.setattr(ex, "LEGACY_CONFIG_PATHS",
+                        [str(tmp_path / "absent-legacy.json")])
     monkeypatch.setattr(ex, "_LEGACY_MERGE", True)
 
     cfg = ex.load_config()
     captured = capsys.readouterr()
     assert captured.out == "" and captured.err == ""
     assert cfg == {"hosts": {}}
-    assert json.loads(primary.read_text()) == {"hosts": {}}
+    # Loading must NOT create the registry file or its directory.
+    assert not primary.exists()
+    assert not primary.parent.exists()
+
+    # First write (add-host path) creates it, mode 0600.
+    ex.save_config({"hosts": {"web1": {"host": "192.0.2.10"}}})
+    assert primary.exists()
+    assert stat.S_IMODE(primary.stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +422,7 @@ def test_u11_legacy_merge_read_only(ex, tmp_path, monkeypatch):
         }}
     legacy.write_text(json.dumps(legacy_payload))
     monkeypatch.setattr(ex, "CONFIG_PATH", str(primary))
-    monkeypatch.setattr(ex, "LEGACY_CONFIG_PATH", str(legacy))
+    monkeypatch.setattr(ex, "LEGACY_CONFIG_PATHS", [str(legacy)])
     monkeypatch.setattr(ex, "_LEGACY_MERGE", True)
 
     cfg = ex.load_config()
@@ -583,3 +595,51 @@ def test_u16_executor_path_vendored(monkeypatch):
         "executor.py")
     assert os.path.isfile(expected)
     assert agssh.handlers.executor_path() == expected
+
+
+# ---------------------------------------------------------------------------
+# U12 — child environment allowlist (maintainer review item 3). ssh/scp
+# children must never inherit the parent Hermes environment: provider API
+# keys plus a SendEnv/AcceptEnv pair would forward them to the remote host.
+# ---------------------------------------------------------------------------
+
+def test_u12_child_env_allowlist(ex, monkeypatch):
+    monkeypatch.setenv("AGSSH_TEST_SECRET", "do-not-forward-me")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-unit-test-should-not-leak")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HOME", "/home/tester")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+
+    env = ex._child_env()
+    assert "AGSSH_TEST_SECRET" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert not any("KEY" in k or "TOKEN" in k or "SECRET" in k for k in env), env
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["HOME"] == "/home/tester"
+    assert env["LC_ALL"] == "C.UTF-8"
+    assert env["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+    allowed = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "SSH_AUTH_SOCK", "TERM"}
+    assert all(k in allowed or k.startswith("LC_") for k in env), env
+
+
+def test_u13_no_skill_path_fallback():
+    """The bundled executor is always present; no ~/.hermes/skills probing.
+    handlers.py uses a relative import, so assert on the shipped source and
+    on the vendored file rather than importing it outside its package."""
+    src = open(os.path.join(_REPO_ROOT, "plugin", "agssh", "handlers.py")).read()
+    assert ".hermes/skills" not in src, "skill-path fallback still present"
+    assert "persistent-ssh" not in src, "skill-path fallback still present"
+    assert os.path.isfile(_VENDORED_EXECUTOR)
+
+
+def test_u14_audit_redacts_secrets(ex, tmp_path, monkeypatch):
+    """Audit lines must not store raw credentials (review recommendation 2)."""
+    log = tmp_path / "agssh.log"
+    monkeypatch.setattr(ex, "_audit_log_path", lambda: str(log))
+    ex.audit_call("web1", 0, 5, 10, False, "tool",
+                  "curl -H 'Authorization: Bearer sk-abcdef0123456789abcdef' https://x")
+    text = log.read_text()
+    assert "sk-abcdef0123456789abcdef" not in text, text

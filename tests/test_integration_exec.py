@@ -331,3 +331,13 @@ def test_a20e_single_element_passthrough(ex, test_host):
     own quoting is honoured: ["sh -c 'exit 7'"] still exits 7."""
     proc = _run_cli(["sh -c 'exit 7'"])
     assert proc.returncode == 7, f"rc={proc.returncode} stderr={proc.stderr!r}"
+
+
+@requires_host
+def test_a19_child_env_not_forwarded(ex, test_host, monkeypatch):
+    """A secret in the parent environment must not reach the remote host."""
+    monkeypatch.setenv("AGSSH_TEST_SECRET", "agssh-do-not-forward-9f3c")
+    env_out = ex.execute(TEST_ALIAS, "env", timeout_s=30)
+    assert env_out["exit_code"] == 0, env_out
+    assert "AGSSH_TEST_SECRET" not in env_out["output"], env_out["output"][:400]
+    assert "agssh-do-not-forward-9f3c" not in env_out["output"]

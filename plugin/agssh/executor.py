@@ -25,7 +25,7 @@ Usage:
     persist-ssh.py fetch <name> <remote> <local>  # download via the shared socket
     persist-ssh.py add-host <name> --host IP [--user U] [--key K] [--port P]
 
-Config: ~/.config/agssh/hosts.json (created empty on first run; a legacy
+Config: <hermes-home>/plugin-data/agssh/hosts.json (created 0600 on first add-host; legacy
 ~/.config/persist-ssh.json is merged in read-only when it exists).
 Env override: AGSSH_REGISTRY or PERSIST_SSH_CONFIG=/path/to/config.json
 (an explicit env path disables the legacy merge).
@@ -57,16 +57,33 @@ import sys
 import time
 import uuid
 
-DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/agssh/hosts.json")
-# Read-only merge base kept for operators who already ran persist-ssh:
-# when the default primary is used and this file exists, its hosts are
-# visible below the primary's (the primary wins per alias). Never written.
-LEGACY_CONFIG_PATH = os.path.expanduser("~/.config/persist-ssh.json")
+def _hermes_home():
+    """Profile-aware Hermes home. One process can serve several profiles, so
+    os.environ['HERMES_HOME'] (the launch profile) is only a CLI fallback."""
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home())
+    except Exception:
+        return os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
+
+
+def _default_config_path():
+    """Per-profile registry, never shared between Hermes profiles."""
+    return os.path.join(_hermes_home(), "plugin-data", "agssh", "hosts.json")
+
+
+# Read-only import sources for operators who already ran the older layouts.
+# Never written; the primary registry wins per alias.
+LEGACY_CONFIG_PATHS = [
+    os.path.expanduser("~/.config/agssh/hosts.json"),
+    os.path.expanduser("~/.config/persist-ssh.json"),
+]
+LEGACY_CONFIG_PATH = LEGACY_CONFIG_PATHS[-1]
 
 _ENV_PATH = (os.environ.get("AGSSH_REGISTRY")
              or os.environ.get("PERSIST_SSH_CONFIG"))
 CONFIG_PATH = os.path.expanduser(_ENV_PATH) if _ENV_PATH \
-    else DEFAULT_CONFIG_PATH
+    else _default_config_path()
 # The legacy merge only applies to the default primary; an explicit env
 # path means full control (tests point it at a temp registry).
 _LEGACY_MERGE = not _ENV_PATH
@@ -85,24 +102,34 @@ def _read_json(path):
 
 
 def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(DEFAULT_SEED, f, indent=2)
+    """Read-only. Loading the plugin must never create the registry."""
     cfg = _read_json(CONFIG_PATH)
-    if _LEGACY_MERGE and LEGACY_CONFIG_PATH != CONFIG_PATH:
-        legacy = _read_json(LEGACY_CONFIG_PATH)
-        if legacy:
-            merged = dict(legacy.get("hosts") or {})
-            merged.update(cfg.get("hosts") or {})
+    if _LEGACY_MERGE:
+        merged = {}
+        for legacy_path in LEGACY_CONFIG_PATHS:
+            if legacy_path == CONFIG_PATH:
+                continue
+            legacy = _read_json(legacy_path)
+            merged.update(legacy.get("hosts") or {})
+        merged.update(cfg.get("hosts") or {})
+        if merged:
             cfg["hosts"] = merged
     cfg.setdefault("hosts", {})
     return cfg
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
+    """Create the registry only here (first add-host), mode 0600."""
+    directory = os.path.dirname(CONFIG_PATH)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
 
 
 def get_host(cfg, name):
@@ -139,6 +166,7 @@ def master_alive(name, info):
              f"{info['user']}@{info['host']}"],
             capture_output=True,
             timeout=6,
+            env=_child_env(),
         )
         return r.returncode == 0
     except subprocess.TimeoutExpired:
@@ -175,7 +203,8 @@ def setup(name, info, quiet=False):
         if not quiet:
             print(f"[persist-ssh] {name}: master already alive ({cp})")
         return True
-    r = subprocess.run(_master_argv(name, info), capture_output=True, text=True)
+    r = subprocess.run(_master_argv(name, info), capture_output=True, text=True,
+                       env=_child_env())
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").lower()
         hint = ""
@@ -204,7 +233,7 @@ def run_command(name, info, cmd, timeout=None):
     cp = control_path(name, info)
     args = ssh_base_args(info, cp) + [f"{info['user']}@{info['host']}"] + cmd
     try:
-        return subprocess.run(args, timeout=timeout)
+        return subprocess.run(args, timeout=timeout, env=_child_env())
     except subprocess.TimeoutExpired:
         sys.exit(f"[persist-ssh] command timed out after {timeout}s (host {name})")
 
@@ -219,7 +248,7 @@ def transfer(name, info, src, dst, direction):
         args = base + [src, f"{target}:{dst}"]
     else:
         args = base + [f"{target}:{src}", dst]
-    return subprocess.run(args)
+    return subprocess.run(args, env=_child_env())
 
 
 def do_list():
@@ -281,8 +310,24 @@ class ConnectError(Exception):
         self.public_error = public_error
 
 
-def _hermes_home():
-    return os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
+def _child_env():
+    """Minimal environment for ssh/scp children.
+
+    The parent Hermes process holds provider API keys; a SendEnv/AcceptEnv
+    pair could forward them to the remote host. Allowlist only what ssh
+    actually needs, never pass the parent environment through.
+    """
+    keep = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "SSH_AUTH_SOCK", "TERM")
+    env = {}
+    for key in keep:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    for key, val in os.environ.items():
+        if key.startswith("LC_"):
+            env[key] = val
+    env.setdefault("PATH", "/usr/bin:/bin")
+    return env
 
 
 def _audit_log_path():
@@ -307,13 +352,30 @@ def _envelope(output="", exit_code=-1, host="", cwd=None, duration_ms=0,
     }
 
 
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{12,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9\-]{10,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+)
+
+
+def _redact_text(text):
+    """Redact secrets before they reach the audit log. Uses Hermes' own
+    redactor when importable, with a conservative built-in fallback."""
+    try:
+        from agent.redact import redact_terminal_output
+        return redact_terminal_output(text)
+    except Exception:
+        return _SECRET_RE.sub("[REDACTED]", text)
+
+
 def audit_call(host, exit_code, duration_ms, chars, truncated, via, command):
     """B15: one line per call, including denials, under a lock, one-generation
     rotation at AUDIT_ROTATE_BYTES. Never raises into the call path."""
     try:
         log_path = _audit_log_path()
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        flat = str(command)[:200].replace("\n", "\\n")
+        flat = _redact_text(str(command))[:200].replace("\n", "\\n")
         host = str(host).replace("\n", "\\n")
         stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         line = (f"{stamp} {host} {exit_code} {int(duration_ms)} {chars} "
@@ -513,7 +575,8 @@ def _spawn_and_verify(name, info):
     try:
         r = subprocess.run(
             _master_argv(name, info), capture_output=True, text=True,
-            timeout=int(info.get("connect_timeout", 10)) + 15)
+            timeout=int(info.get("connect_timeout", 10)) + 15,
+            env=_child_env())
     except subprocess.TimeoutExpired:
         return (-1, "ssh master spawn timed out locally")
     if r.returncode == 0 and _wait_master_up(name, info):
@@ -640,7 +703,8 @@ def _run_capture(argv, watchdog_s, capture_max):
     Returns (returncode, output_text, hit_ceiling, watchdog_fired).
     """
     proc = subprocess.Popen(
-        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=_child_env())
     fd = proc.stdout.fileno()
     os.set_blocking(fd, False)
     buf = bytearray()
@@ -709,7 +773,7 @@ def _remote_pkill(name, info, sentinel):
     argv = _command_argv(name, info, remote,
                          int(info.get("connect_timeout", 10)))
     try:
-        subprocess.run(argv, capture_output=True, timeout=15)
+        subprocess.run(argv, capture_output=True, timeout=15, env=_child_env())
     except (OSError, subprocess.TimeoutExpired):
         pass
 
@@ -1074,6 +1138,7 @@ def main():
             ["ssh", "-O", "exit", "-o", f"ControlPath={cp}",
              f"{info['user']}@{info['host']}"],
             capture_output=True, text=True,
+            env=_child_env(),
         )
         print(f"[persist-ssh] {args.name}: closed" if r.returncode == 0
               else f"[persist-ssh] {args.name}: nothing to close ({r.stderr.strip()})")
