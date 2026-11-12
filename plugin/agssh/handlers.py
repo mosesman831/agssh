@@ -4,7 +4,7 @@ Module attrs (EX, EX_PATH, HOSTS, BOOT_ERRORS, TOOL_NAMES, MODE) are filled
 by agssh.register() once per process; handlers read them at call time so a
 re-register simply rebinds. Every Hermes import is lazy inside functions:
 this module must import cleanly outside Hermes (tests stub agent.redact,
-tools.approval_detection and tools.approval in sys.modules).
+tools.approval_detection in sys.modules).
 """
 
 import importlib.util
@@ -34,10 +34,7 @@ def executor_path():
         return override
     vendored = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "executor.py")
-    if os.path.isfile(vendored):
-        return vendored
-    return os.path.expanduser(
-        "~/.hermes/skills/devops/persistent-ssh/scripts/persist-ssh.py")
+    return vendored
 
 
 def load_executor():

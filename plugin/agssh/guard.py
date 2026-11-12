@@ -2,7 +2,7 @@
 
 Hermes imports stay lazy inside functions so this module loads cleanly
 outside a Hermes process (tests stub tools.approval_detection /
-tools.approval). Shared session state arrives through configure() from
+tools.approval_detection). Shared session state arrives through configure() from
 agssh.register(); no import cycle back into the package __init__.
 """
 
@@ -131,12 +131,24 @@ def find_registered_ssh_dest(command, hosts):
     return None
 
 
+def _detect(command):
+    """(is_hardline, is_dangerous, description) via Hermes' own detection.
+    Raises when the detector is unavailable so callers can fail closed."""
+    from tools.approval_detection import (
+        detect_dangerous_command, detect_hardline_command)
+    is_hardline, hard_desc = detect_hardline_command(command)
+    if is_hardline:
+        return True, False, hard_desc
+    is_dangerous, _pattern_key, description = detect_dangerous_command(command)
+    return False, bool(is_dangerous), description
+
+
 def guard_command(tool_name, command, alias=None):
-    """Pre-execute gate for host command tools: hardline patterns are
-    denied outright (never approval-bypassed), dangerous patterns go
-    through request_tool_approval. Returns a denial envelope or None to
-    proceed. Any failure of the approval subsystem fails closed. The
-    caller (handler) audits denials with via="tool"."""
+    """Pre-execute gate for host command tools: hardline patterns are denied
+    outright. Dangerous patterns are gated by the public approval route in
+    on_pre_tool_call (Hermes prompts before the handler ever runs), so this
+    function does not call any private approval API. Detection failure fails
+    closed. The caller (handler) audits denials with via="tool"."""
     if alias is None and isinstance(tool_name, str) \
             and tool_name.startswith("agssh-"):
         alias = tool_name[len("agssh-"):]
@@ -144,36 +156,52 @@ def guard_command(tool_name, command, alias=None):
         return None  # execute reports bad_command
     host = str(alias or "")
     try:
-        from tools.approval_detection import (
-            detect_dangerous_command, detect_hardline_command)
-        is_hardline, description = detect_hardline_command(command)
-        if is_hardline:
-            return _envelope(
-                exit_code=-1, host=host,
-                error=f"hardline blocked on '{host}': {description}")
-        is_dangerous, pattern_key, description = detect_dangerous_command(command)
-        if not is_dangerous:
-            return None
-        from tools.approval import request_tool_approval
-        result = request_tool_approval(tool_name, description,
-                                       rule_key=pattern_key)
-        if result.get("approved"):
-            return None
-        message = result.get("message") or description
-        return _envelope(
-            exit_code=-1, host=host,
-            error=f"approval denied for '{host}': {message}")
+        is_hardline, _is_dangerous, description = _detect(command)
     except Exception:
         return _envelope(
             exit_code=-1, host=host,
             error=f"approval denied for '{host}':"
                   " approval subsystem unavailable")
+    if is_hardline:
+        return _envelope(
+            exit_code=-1, host=host,
+            error=f"hardline blocked on '{host}': {description}")
+    return None
+
+
+def _is_agssh_command_tool(tool_name):
+    return tool_name == "agssh" or (
+        isinstance(tool_name, str) and tool_name.startswith("agssh-")
+        and tool_name not in ("agssh-read", "agssh-find", "agssh-hosts"))
 
 
 def on_pre_tool_call(tool_name, args, **kwargs):
-    """pre_tool_call hook (B11): veto `terminal` commands that ssh to a
-    host which owns an agssh command tool this session. Disabled by
-    plugins.entries.agssh.settings.block_raw_ssh: false."""
+    """pre_tool_call hook.
+
+    1. agssh command tools: hardline commands are blocked; dangerous ones
+       return the public {"action": "approve"} route so Hermes runs its own
+       approval prompt. No private approval API is called.
+    2. B11: veto `terminal` commands that ssh to a host which owns an agssh
+       command tool this session. Disabled by block_raw_ssh: false.
+    """
+    if _is_agssh_command_tool(tool_name):
+        if not isinstance(args, dict):
+            return None
+        command = args.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return None
+        try:
+            is_hardline, is_dangerous, description = _detect(command)
+        except Exception:
+            return {"action": "block",
+                    "message": "agssh: approval subsystem unavailable;"
+                               " command not run."}
+        if is_hardline:
+            return {"action": "block",
+                    "message": f"agssh: hardline blocked: {description}"}
+        if is_dangerous:
+            return {"action": "approve", "message": description}
+        return None
     if tool_name != "terminal":
         return None
     ctx = _CTX

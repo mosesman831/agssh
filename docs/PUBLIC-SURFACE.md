@@ -26,18 +26,17 @@ changes shape, only the call that needed it fails, and it fails closed.
   `ctx.classify_command(command) -> (tier, description)` — so plugins inherit the policy without
   importing `tools.*`.
 
-## 2. `tools.approval` — the human approval gate
+## 2. Approval — now on the public route (no private import)
 
-- **Import site:** `agssh/guard.py::guard_command` —
-  `from tools.approval import request_tool_approval`.
-- **Why it is used:** dangerous-but-allowed commands must reach the same human gate Hermes terminal
-  commands use — session and permanent allowlists, the CLI prompt, and gateway pending approvals —
-  under the tool's own name. Inventing a second approval system would split the operator's
-  allowlists and audit trail.
-- **Fail-closed fallback:** any import or call failure returns the same denial envelope as above.
-  No approval path, no execution.
-- **Public seam needed:** a documented `ctx.request_approval(tool, reason)` plugin API that routes
-  to the Hermes gate.
+- **Resolved.** `agssh` no longer imports `tools.approval`. Dangerous-but-allowed commands are
+  gated by returning `{"action": "approve", "message": ...}` from the plugin's own
+  `pre_tool_call` hook when the tool is `agssh` or `agssh-<alias>`. Hermes then runs its own
+  approval flow under the tool's name, so session and permanent allowlists, the CLI prompt and
+  gateway pending approvals all still apply, and a denial means the handler is never called.
+- **Hardline** commands return `{"action": "block", ...}` from the same hook, and are additionally
+  refused inside the handler as defence in depth, so a direct handler call cannot run them either.
+- **Fail-closed:** if detection is unavailable the hook blocks and the handler returns a denial
+  envelope. No detection, no execution.
 
 ## 3. `agent.redact` — model-facing output redaction
 

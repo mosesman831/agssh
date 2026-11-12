@@ -606,13 +606,33 @@ def test_register_tool_modes(ex, tmp_registry, fake_ctx, tmp_path,
 @requires_host
 def test_a15_guard_denials(ex, tmp_registry, fake_ctx, tmp_path,
                            monkeypatch, test_host):
-    """Dangerous command denied by approval stub does not run; hardline is
-    blocked even with approval+yolo stubbed on."""
+    """Approval goes through the PUBLIC route: the pre_tool_call hook returns
+    {"action": "approve"} for dangerous agssh commands (Hermes then prompts and
+    never calls the handler on denial), and blocks hardline outright. Hardline
+    is also denied in the handler as defence in depth, even with yolo on."""
     import tools.approval_detection  # noqa: F401  (contract: standalone import)
     _install_hosts_registry(monkeypatch, ex, tmp_registry, tmp_path,
                             {TEST_ALIAS: dict(test_host)})
-    _stub_approval(monkeypatch, {"approved": False, "message": "denied for test"})
     _register_plugin(fake_ctx)
+
+    tool_name = agssh_handlers.TOOL_NAMES.get(TEST_ALIAS, "agssh")
+
+    # Dangerous: the hook must hand the decision to Hermes, not decide itself.
+    decision = agssh_guard.on_pre_tool_call(
+        tool_name, {"command": "rm -rf /tmp/agssh-a15", "host": TEST_ALIAS})
+    assert isinstance(decision, dict), decision
+    assert decision.get("action") == "approve", decision
+    assert decision.get("message"), decision
+
+    # Hardline: blocked at the hook, before any handler runs.
+    hard = agssh_guard.on_pre_tool_call(
+        tool_name, {"command": "rm -rf /", "host": TEST_ALIAS})
+    assert isinstance(hard, dict) and hard.get("action") == "block", hard
+    assert "hardline" in hard.get("message", ""), hard
+
+    # A benign command is not gated at all.
+    assert agssh_guard.on_pre_tool_call(
+        tool_name, {"command": "hostname", "host": TEST_ALIAS}) is None
 
     setup = ex.execute(
         TEST_ALIAS,
@@ -620,20 +640,16 @@ def test_a15_guard_denials(ex, tmp_registry, fake_ctx, tmp_path,
         timeout_s=30)
     assert setup["exit_code"] == 0, setup
     try:
-        _, env = _call_host_tool(TEST_ALIAS, "rm -rf /tmp/agssh-a15",
-                                 ctx=fake_ctx)
-        assert env.get("exit_code") == -1, env
-        assert "approval denied" in (env.get("error") or ""), env
-        chk = ex.execute(
-            TEST_ALIAS, "test -f /tmp/agssh-a15/sentinel && echo EXISTS",
-            timeout_s=30)
-        assert "EXISTS" in chk.get("output", ""), chk
-
-        _stub_approval(monkeypatch, {"approved": True, "message": "ok"})
+        # Defence in depth: even with yolo stubbed on, the handler refuses
+        # hardline, and nothing is removed on the remote host.
         _stub_yolo(monkeypatch)
         _, env2 = _call_host_tool(TEST_ALIAS, "rm -rf /", ctx=fake_ctx)
         assert env2.get("exit_code") == -1, env2
         assert "hardline blocked" in (env2.get("error") or ""), env2
+        chk = ex.execute(
+            TEST_ALIAS, "test -f /tmp/agssh-a15/sentinel && echo EXISTS",
+            timeout_s=30)
+        assert "EXISTS" in chk.get("output", ""), chk
     finally:
         ex.execute(TEST_ALIAS, "rm -rf /tmp/agssh-a15", timeout_s=30)
 
