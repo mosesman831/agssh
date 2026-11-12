@@ -34,29 +34,37 @@ Execution properties:
 
 Requirements: an OpenSSH client (`ssh` on PATH) and Hermes with plugin support.
 
-From the catalog (the plugin lives in `plugin/agssh`):
+**Recommended:**
 
 ```
-hermes plugins install <owner>/agssh
+hermes plugins install mosesman831/agssh
+hermes plugins enable agssh
 ```
 
-From a clone:
+That is the whole install. The plugin ships its own executor; nothing else on the
+machine is modified. Tools appear on the next session.
+
+From a clone (for development):
 
 ```
-git clone <repo-url> && cd agssh
+git clone https://github.com/mosesman831/agssh && cd agssh
 scripts/install.sh
 ```
 
-`install.sh` symlinks `plugin/agssh` into `~/.hermes/plugins/agssh` and `bin/agssh` into
-`~/bin/agssh`, and patches the `persist-ssh` skill's executor if one is installed (the plugin
-otherwise uses its own vendored copy). The CLI is optional — the agent tools do not need it — but it
-is how a human drives the same executor, and it provides `agssh add-host`. Tools appear on the next
-session.
+`install.sh` only symlinks `plugin/agssh` into `~/.hermes/plugins/agssh` and `bin/agssh`
+into `~/bin/agssh`. It does **not** touch any other skill. If you also run the older
+`persist-ssh` skill and want its script to share this executor, that patch is opt-in:
+`scripts/install.sh --patch-persist-ssh` (it writes a `.agssh-orig` backup first).
+
+The CLI is optional — the agent tools do not need it — but it is how a human drives the
+same executor, and it provides `agssh add-host`.
 
 ## Add a host
 
-The registry is `~/.config/agssh/hosts.json` (plugin-owned, created empty). A legacy
-`~/.config/persist-ssh.json` is merged in read-only when present — the primary wins per alias.
+The registry is per profile: `<hermes-home>/plugin-data/agssh/hosts.json`, created with
+mode `0600` on your first `agssh add-host` and never written at plugin load. Older
+`~/.config/agssh/hosts.json` and `~/.config/persist-ssh.json` files are merged in
+read-only when present — the primary wins per alias.
 `AGSSH_REGISTRY` (or `PERSIST_SSH_CONFIG`) overrides the path.
 
 ```
@@ -165,7 +173,7 @@ only when `AGSSH_TEST_HOST` names an alias in your live registry:
 AGSSH_TEST_HOST=web1 python -m pytest tests/
 ```
 
-Host details never live in the repo — the alias is resolved from `~/.config/agssh/hosts.json` at
+Host details never live in the repo — the alias is resolved from the per-profile registry at
 run time.
 
 ## License
